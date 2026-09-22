@@ -28,6 +28,7 @@
 
 #include "opencv2/highgui/highgui.hpp"
 #include <fstream>
+#include <iomanip>
 
 namespace sdv_loam
 {
@@ -35,8 +36,100 @@ int FrameHessian::instanceCounter=0;
 int PointHessian::instanceCounter=0;
 int CalibHessian::instanceCounter=0;
 
-FullSystem::FullSystem():nh("~")
+namespace
 {
+std::string withSuffixBeforeExtension(const std::string& file, const std::string& suffix)
+{
+	const std::string::size_type slash = file.find_last_of("/\\");
+	const std::string::size_type dot = file.find_last_of('.');
+	if(dot != std::string::npos && (slash == std::string::npos || dot > slash))
+		return file.substr(0, dot) + suffix + file.substr(dot);
+	return file + suffix;
+}
+
+std::string replaceExtension(const std::string& file, const std::string& extension)
+{
+	const std::string::size_type slash = file.find_last_of("/\\");
+	const std::string::size_type dot = file.find_last_of('.');
+	if(dot != std::string::npos && (slash == std::string::npos || dot > slash))
+		return file.substr(0, dot) + extension;
+	return file + extension;
+}
+
+void writeTrajectoryEntry(std::ofstream& kittiFile,
+	std::ofstream& timestampFile,
+	std::ofstream& tumFile,
+	std::ofstream& activeCameraFile,
+	double timestamp,
+	int cameraId,
+	const SE3& T_WL)
+{
+	Eigen::Quaterniond q;
+
+	q.w() = T_WL.so3().unit_quaternion().w();
+	q.x() = T_WL.so3().unit_quaternion().x();
+	q.y() = T_WL.so3().unit_quaternion().y();
+	q.z() = T_WL.so3().unit_quaternion().z();
+
+	Eigen::Matrix3d R = q.toRotationMatrix();
+	Eigen::Vector3d t = T_WL.translation();
+
+	kittiFile << std::fixed << std::setprecision(9)
+		<< R(0, 0) << " " << R(0, 1) << " " << R(0, 2) << " " << t(0, 0) << " "
+		<< R(1, 0) << " " << R(1, 1) << " " << R(1, 2) << " " << t(1, 0) << " "
+		<< R(2, 0) << " " << R(2, 1) << " " << R(2, 2) << " " << t(2, 0) << "\n";
+
+	timestampFile << std::fixed << std::setprecision(9) << timestamp << "\n";
+
+	tumFile << std::fixed << std::setprecision(9)
+		<< timestamp << " "
+		<< t(0, 0) << " " << t(1, 0) << " " << t(2, 0) << " "
+		<< q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+
+	activeCameraFile << std::fixed << std::setprecision(9)
+		<< timestamp << " " << cameraId << "\n";
+}
+}
+
+FullSystem::FullSystem()
+	: nh("~"),
+	  rigPoseValid(false),
+	  isLost(visualState.isLost),
+	  initFailed(visualState.initFailed),
+	  initialized(visualState.initialized),
+	  allFrameHistory(visualState.allFrameHistory),
+	  coarseInitializer(visualState.coarseInitializer),
+	  lastCoarseRMSE(visualState.lastCoarseRMSE),
+	  allKeyFramesHistory(visualState.allKeyFramesHistory),
+	  ef(visualState.ef),
+	  selectionMap(visualState.selectionMap),
+	  selectionMapFromLidar(visualState.selectionMapFromLidar),
+	  coarseDistanceMap(visualState.coarseDistanceMap),
+	  frameHessians(visualState.frameHessians),
+	  activeResiduals(visualState.activeResiduals),
+	  currentMinActDist(visualState.currentMinActDist),
+	  allResVec(visualState.allResVec),
+	  coarseTracker_forNewKF(visualState.coarseTracker_forNewKF),
+	  coarseTracker(visualState.coarseTracker),
+	  needNewKFAfter(visualState.needNewKFAfter)
+{
+	maxCoarseTrackingRMSE = 12.0f;
+	visualStatesByCamera[0] = &visualState;
+
+	if(rigState.cameras.empty())
+	{
+		rigState.cameras.emplace_back(SE3());
+		rigState.activeCameraId = 0;
+	}
+
+	ensureActiveCameraCalibration();
+	cameraCalibrations[rigState.activeCameraId].fx = Hcalib.fxl();
+	cameraCalibrations[rigState.activeCameraId].fy = Hcalib.fyl();
+	cameraCalibrations[rigState.activeCameraId].cx = Hcalib.cxl();
+	cameraCalibrations[rigState.activeCameraId].cy = Hcalib.cyl();
+	syncActiveRigExtrinsicFromCalibration();
+	syncActiveCameraCalibrationCache();
+
 	initializationValue();
 }
 
@@ -57,29 +150,536 @@ FullSystem::~FullSystem()
 		nullspacesLog->close(); delete nullspacesLog;
 	}
 
-	delete[] selectionMap;
-
-	delete[] selectionMapFromLidar;
-
-	for(FrameShell* s : allFrameHistory)
-		delete s;
 	for(FrameHessian* fh : unmappedTrackedFrames)
 		delete fh;
 
-	delete coarseDistanceMap;
-	delete coarseTracker;
-	delete coarseTracker_forNewKF;
-	delete coarseInitializer;
+	for(std::map<int, VisualState*>::iterator it = visualStatesByCamera.begin(); it != visualStatesByCamera.end(); ++it)
+	{
+		destroyVisualState(*it->second);
+		if(it->second != &visualState)
+			delete it->second;
+	}
+
 	delete pixelSelector;
-	delete ef;
+}
+
+void FullSystem::initializeVisualState(VisualState& state)
+{
+	state.selectionMap = new float[wG[0]*hG[0]];
+	state.selectionMapFromLidar = 0;
+
+	state.coarseDistanceMap = new CoarseDistanceMap(wG[0], hG[0]);
+	state.coarseTracker = new CoarseTracker(wG[0], hG[0]);
+	state.coarseTracker_forNewKF = new CoarseTracker(wG[0], hG[0]);
+	state.coarseInitializer = new CoarseInitializer(wG[0], hG[0]);
+
+	state.lastCoarseRMSE.setConstant(100);
+	state.currentMinActDist = 2;
+	state.initialized = false;
+	state.isLost = false;
+	state.initFailed = false;
+	state.needNewKFAfter = -1;
+
+	state.ef = new EnergyFunctional();
+	state.ef->red = &this->treadReduce;
+}
+
+void FullSystem::destroyVisualState(VisualState& state)
+{
+	delete[] state.selectionMap;
+	state.selectionMap = 0;
+
+	delete[] state.selectionMapFromLidar;
+	state.selectionMapFromLidar = 0;
+
+	for(FrameShell* s : state.allFrameHistory)
+		delete s;
+	state.allFrameHistory.clear();
+
+	delete state.coarseDistanceMap;
+	state.coarseDistanceMap = 0;
+	delete state.coarseTracker;
+	state.coarseTracker = 0;
+	delete state.coarseTracker_forNewKF;
+	state.coarseTracker_forNewKF = 0;
+	delete state.coarseInitializer;
+	state.coarseInitializer = 0;
+	delete state.ef;
+	state.ef = 0;
+}
+
+VisualState& FullSystem::ensureVisualState(int cameraId)
+{
+	assert(cameraId >= 0);
+
+	std::map<int, VisualState*>::iterator it = visualStatesByCamera.find(cameraId);
+	if(it != visualStatesByCamera.end())
+		return *it->second;
+
+	VisualState* state = new VisualState();
+	initializeVisualState(*state);
+	visualStatesByCamera[cameraId] = state;
+	return *state;
+}
+
+void FullSystem::ensureActiveRigCamera()
+{
+	if(rigState.cameras.empty())
+	{
+		rigState.cameras.emplace_back(SE3());
+	}
+
+	if(rigState.activeCameraId < 0 || rigState.activeCameraId >= static_cast<int>(rigState.cameras.size()))
+	{
+		rigState.activeCameraId = 0;
+	}
+}
+
+void FullSystem::ensureActiveCameraCalibration()
+{
+	ensureActiveRigCamera();
+
+	if(cameraCalibrations.empty())
+	{
+		cameraCalibrations.emplace_back();
+	}
+
+	if(rigState.activeCameraId >= static_cast<int>(cameraCalibrations.size()))
+	{
+		cameraCalibrations.resize(rigState.activeCameraId + 1);
+	}
+}
+
+void FullSystem::syncActiveCameraCalibrationCache()
+{
+	ensureActiveCameraCalibration();
+	CameraCalibration& calibration = cameraCalibrations[rigState.activeCameraId];
+
+	Rlc = calibration.T_LC.rotationMatrix();
+	tlc = calibration.T_LC.translation();
+	fx = calibration.fx;
+	cx = calibration.cx;
+	fy = calibration.fy;
+	cy = calibration.cy;
+}
+
+void FullSystem::syncActiveRigExtrinsicFromCalibration()
+{
+	ensureActiveCameraCalibration();
+	rigState.camera(rigState.activeCameraId).setT_LC(cameraCalibrations[rigState.activeCameraId].T_LC);
+}
+
+void FullSystem::syncRigStateFromCameraPose(int cameraId, const SE3& T_WC)
+{
+	if(rigState.hasCamera(cameraId))
+		rigState.updateT_WLFromCameraPose(cameraId, T_WC);
+	else
+		rigState.T_WL = T_WC;
+
+	rigPoseValid = true;
+}
+
+void FullSystem::syncRigStateFromCameraPose(const SE3& T_WC)
+{
+	syncRigStateFromCameraPose(rigState.activeCameraId, T_WC);
+}
+
+void FullSystem::syncRigStateFromFrameShell(const FrameShell* shell)
+{
+	if(shell == 0 || !shell->poseValid) return;
+	if(!shell->updatesRigPose) return;
+	const int cameraId = shell->cameraId >= 0 ? shell->cameraId : rigState.activeCameraId;
+	syncRigStateFromCameraPose(cameraId, shell->getT_WC());
+}
+
+SE3 FullSystem::getRigPoseForCameraPose(int cameraId, const SE3& T_WC) const
+{
+	if(rigState.hasCamera(cameraId))
+	{
+		return rigState.getT_WLFromT_WC(cameraId, T_WC);
+	}
+
+	return T_WC;
+}
+
+SE3 FullSystem::getRigPoseForCameraPose(const SE3& T_WC) const
+{
+	return getRigPoseForCameraPose(rigState.activeCameraId, T_WC);
+}
+
+SE3 FullSystem::getRigPose() const
+{
+	return rigState.T_WL;
+}
+
+SE3 FullSystem::getRigPoseForFrameShell(const FrameShell* shell) const
+{
+	if(shell == 0 || !shell->poseValid) return SE3();
+	const int cameraId = shell->cameraId >= 0 ? shell->cameraId : rigState.activeCameraId;
+	return getRigPoseForCameraPose(cameraId, shell->getT_WC());
+}
+
+SE3 FullSystem::getActiveCameraPoseFromRig() const
+{
+	if(rigState.hasCamera(rigState.activeCameraId))
+	{
+		return rigState.getT_WC(rigState.activeCameraId);
+	}
+
+	return SE3();
+}
+
+void FullSystem::recordRigPoseSnapshot(double timestamp)
+{
+	recordRigPoseSnapshot(timestamp, rigState.activeCameraId, getRigPose());
+}
+
+void FullSystem::recordRigPoseSnapshot(double timestamp, int cameraId)
+{
+	recordRigPoseSnapshot(timestamp, cameraId, getRigPose());
+}
+
+void FullSystem::recordRigPoseSnapshot(double timestamp, const SE3& T_WL)
+{
+	recordRigPoseSnapshot(timestamp, rigState.activeCameraId, T_WL);
+}
+
+void FullSystem::recordRigPoseSnapshot(double timestamp, int cameraId, const SE3& T_WL)
+{
+	boost::unique_lock<boost::mutex> lock(trackMutex);
+	rigPoseSnapshots.push_back(RigPoseSnapshot(timestamp, cameraId, T_WL));
+}
+
+bool FullSystem::alignVisualStateToRigPose(int cameraId, const SE3& T_WL)
+{
+	if(!rigState.hasCamera(cameraId))
+		return false;
+
+	std::map<int, VisualState*>::iterator stateIt = visualStatesByCamera.find(cameraId);
+	if(stateIt == visualStatesByCamera.end() || stateIt->second == 0)
+		return false;
+
+	VisualState& state = *stateIt->second;
+	FrameShell* referenceShell = 0;
+	for(std::vector<FrameShell*>::reverse_iterator it = state.allFrameHistory.rbegin();
+		it != state.allFrameHistory.rend();
+		++it)
+	{
+		if(*it != 0 && (*it)->poseValid)
+		{
+			referenceShell = *it;
+			break;
+		}
+	}
+
+	if(referenceShell == 0)
+		return false;
+
+	const SE3 targetReferenceT_WC = T_WL * rigState.camera(cameraId).T_CL;
+	const SE3 alignment = targetReferenceT_WC * referenceShell->getT_WC().inverse();
+
+	boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
+	for(FrameShell* shell : state.allFrameHistory)
+	{
+		if(shell == 0 || !shell->poseValid)
+			continue;
+		shell->setT_WC(alignment * shell->getT_WC());
+	}
+
+	for(FrameHessian* fh : state.frameHessians)
+	{
+		if(fh == 0 || fh->shell == 0 || !fh->shell->poseValid)
+			continue;
+		fh->setT_WC_scaled(fh->shell->getT_WC(), fh->shell->aff_g2l);
+	}
+
+	rigState.T_WL = T_WL;
+	rigPoseValid = true;
+	return true;
+}
+
+bool FullSystem::resetVisualStateForCamera(int cameraId, const SE3& T_WL)
+{
+	if(cameraId < 0)
+		return false;
+
+	// Do not destroy the previous state here. Mapping/tracking can still hold
+	// FrameHessian/residual pointers from it while a camera switch is processed.
+	// Replacing the camera slot with a fresh state avoids dangling pointers and
+	// lets the old state die with the process after this experimental run.
+	VisualState* state = new VisualState();
+	initializeVisualState(*state);
+	visualStatesByCamera[cameraId] = state;
+
+	rigState.T_WL = T_WL;
+	rigPoseValid = true;
+	return true;
+}
+
+CameraCalibration& FullSystem::getActiveCameraCalibration()
+{
+	ensureActiveCameraCalibration();
+	return cameraCalibrations[rigState.activeCameraId];
+}
+
+const CameraCalibration& FullSystem::getActiveCameraCalibration() const
+{
+	assert(rigState.activeCameraId >= 0 && rigState.activeCameraId < static_cast<int>(cameraCalibrations.size()));
+	return cameraCalibrations[rigState.activeCameraId];
+}
+
+void FullSystem::setActiveCameraId(int cameraId)
+{
+	assert(cameraId >= 0);
+
+	if(cameraId >= static_cast<int>(rigState.cameras.size()))
+	{
+		rigState.cameras.resize(cameraId + 1);
+	}
+	if(cameraId >= static_cast<int>(cameraCalibrations.size()))
+	{
+		cameraCalibrations.resize(cameraId + 1);
+	}
+
+	rigState.activeCameraId = cameraId;
+	ensureVisualState(cameraId);
+	syncActiveRigExtrinsicFromCalibration();
+	syncActiveCameraCalibrationCache();
+}
+
+VisualState& FullSystem::getVisualState(int cameraId)
+{
+	return ensureVisualState(cameraId);
+}
+
+const VisualState& FullSystem::getVisualState(int cameraId) const
+{
+	std::map<int, VisualState*>::const_iterator it = visualStatesByCamera.find(cameraId);
+	if(it != visualStatesByCamera.end())
+		return *it->second;
+
+	return visualState;
+}
+
+std::vector<int> FullSystem::getConfiguredCameraIds() const
+{
+	std::vector<int> cameraIds;
+	cameraIds.reserve(cameraCalibrations.size());
+	for(size_t cameraId = 0; cameraId < cameraCalibrations.size(); ++cameraId)
+		cameraIds.push_back(static_cast<int>(cameraId));
+
+	return cameraIds;
+}
+
+void FullSystem::enqueueCameraFrame(int cameraId, const cv::Mat& frame, double timestamp)
+{
+	assert(cameraId >= 0);
+	qImgByCamera[cameraId].push(frame);
+	qTimeImgByCamera[cameraId].push(timestamp);
+}
+
+void FullSystem::enqueueLidarProjection(const LidarProjectionResult& lidarProjection)
+{
+	assert(lidarProjection.cameraId >= 0);
+	qLidarProjectionResultsByCamera[lidarProjection.cameraId].push(lidarProjection);
+}
+
+bool FullSystem::hasQueuedCameraCandidate(int cameraId) const
+{
+	std::map<int, std::queue<cv::Mat> >::const_iterator imageIt = qImgByCamera.find(cameraId);
+	std::map<int, std::queue<double> >::const_iterator timeIt = qTimeImgByCamera.find(cameraId);
+	std::map<int, std::queue<LidarProjectionResult> >::const_iterator lidarIt =
+		qLidarProjectionResultsByCamera.find(cameraId);
+
+	return imageIt != qImgByCamera.end() &&
+		timeIt != qTimeImgByCamera.end() &&
+		lidarIt != qLidarProjectionResultsByCamera.end() &&
+		!imageIt->second.empty() &&
+		!timeIt->second.empty() &&
+		!lidarIt->second.empty();
+}
+
+bool FullSystem::synchronizeQueuedCameraCandidate(int cameraId, double maxSyncError)
+{
+	std::map<int, std::queue<cv::Mat> >::iterator imageIt = qImgByCamera.find(cameraId);
+	std::map<int, std::queue<double> >::iterator timeIt = qTimeImgByCamera.find(cameraId);
+	std::map<int, std::queue<LidarProjectionResult> >::iterator lidarIt =
+		qLidarProjectionResultsByCamera.find(cameraId);
+
+	if(imageIt == qImgByCamera.end() ||
+		timeIt == qTimeImgByCamera.end() ||
+		lidarIt == qLidarProjectionResultsByCamera.end())
+	{
+		return false;
+	}
+
+	while(!imageIt->second.empty() && !timeIt->second.empty() && !lidarIt->second.empty())
+	{
+		const double imageTimestamp = timeIt->second.front();
+		const double lidarTimestamp = lidarIt->second.front().lidarTimestamp;
+		const double syncError = fabs(imageTimestamp - lidarTimestamp);
+
+		if(syncError <= maxSyncError)
+			return true;
+
+		if(imageTimestamp < lidarTimestamp)
+		{
+			imageIt->second.pop();
+			timeIt->second.pop();
+			droppedImagesTooOldByCamera[cameraId]++;
+		}
+		else
+		{
+			lidarIt->second.pop();
+			droppedLidarTooOldByCamera[cameraId]++;
+		}
+	}
+
+	return false;
+}
+
+std::vector<int> FullSystem::getQueuedCameraCandidateIds() const
+{
+	std::vector<int> cameraIds;
+	for(std::map<int, std::queue<cv::Mat> >::const_iterator it = qImgByCamera.begin();
+		it != qImgByCamera.end();
+		++it)
+	{
+		if(hasQueuedCameraCandidate(it->first))
+			cameraIds.push_back(it->first);
+	}
+
+	return cameraIds;
+}
+
+std::vector<int> FullSystem::getSynchronizedCameraCandidateIds(double maxSyncError)
+{
+	std::vector<int> cameraIds;
+	for(std::map<int, std::queue<cv::Mat> >::iterator it = qImgByCamera.begin();
+		it != qImgByCamera.end();
+		++it)
+	{
+		if(synchronizeQueuedCameraCandidate(it->first, maxSyncError))
+			cameraIds.push_back(it->first);
+	}
+
+	return cameraIds;
+}
+
+CameraFrameInput FullSystem::buildQueuedCameraCandidate(int cameraId) const
+{
+	assert(hasQueuedCameraCandidate(cameraId));
+
+	CameraFrameInput input;
+	input.cameraId = cameraId;
+	input.frame = qImgByCamera.find(cameraId)->second.front();
+	input.imageTimestamp = qTimeImgByCamera.find(cameraId)->second.front();
+	input.lidarProjection = qLidarProjectionResultsByCamera.find(cameraId)->second.front();
+	return input;
+}
+
+void FullSystem::popQueuedCameraCandidate(int cameraId)
+{
+	assert(hasQueuedCameraCandidate(cameraId));
+
+	qImgByCamera[cameraId].pop();
+	qTimeImgByCamera[cameraId].pop();
+	qLidarProjectionResultsByCamera[cameraId].pop();
+}
+
+int FullSystem::getCameraCalibrationCount() const
+{
+	return static_cast<int>(cameraCalibrations.size());
+}
+
+bool FullSystem::hasCameraCalibration(int cameraId) const
+{
+	return cameraId >= 0 && cameraId < static_cast<int>(cameraCalibrations.size());
+}
+
+CameraCalibration& FullSystem::getCameraCalibration(int cameraId)
+{
+	assert(cameraId >= 0);
+
+	ensureActiveRigCamera();
+	if(cameraId >= static_cast<int>(cameraCalibrations.size()))
+	{
+		cameraCalibrations.resize(cameraId + 1);
+	}
+	if(cameraId >= static_cast<int>(rigState.cameras.size()))
+	{
+		rigState.cameras.resize(cameraId + 1);
+	}
+
+	return cameraCalibrations[cameraId];
+}
+
+const CameraCalibration& FullSystem::getCameraCalibration(int cameraId) const
+{
+	assert(hasCameraCalibration(cameraId));
+	return cameraCalibrations[cameraId];
 }
 
 void FullSystem::loadSensorPrameters(const std::string &pathSensorParameter)
+{
+	loadSensorPrameters(rigState.activeCameraId, pathSensorParameter);
+}
+
+void FullSystem::setCameraCalibration(int cameraId, const CameraCalibration& calibration)
+{
+	CameraCalibration& targetCalibration = getCameraCalibration(cameraId);
+	targetCalibration = calibration;
+	rigState.camera(cameraId).setT_LC(targetCalibration.T_LC);
+
+	if(cameraId == rigState.activeCameraId)
+		syncActiveCameraCalibrationCache();
+}
+
+void FullSystem::setCameraIntrinsics(int cameraId, float fx_, float fy_, float cx_, float cy_)
+{
+	CameraCalibration& calibration = getCameraCalibration(cameraId);
+	calibration.fx = fx_;
+	calibration.fy = fy_;
+	calibration.cx = cx_;
+	calibration.cy = cy_;
+
+	if(cameraId == rigState.activeCameraId)
+		syncActiveCameraCalibrationCache();
+}
+
+void FullSystem::setVisualCalibration(int cameraId, const Eigen::Matrix3f& K)
+{
+	setActiveCameraId(cameraId);
+
+	VecC initial_value = VecC::Zero();
+	initial_value[0] = K(0, 0);
+	initial_value[1] = K(1, 1);
+	initial_value[2] = K(0, 2);
+	initial_value[3] = K(1, 2);
+
+	Hcalib.setValueScaled(initial_value);
+	Hcalib.value_zero = Hcalib.value;
+	Hcalib.value_minus_value_zero.setZero();
+	Hcalib.step.setZero();
+	Hcalib.step_backup.setZero();
+	Hcalib.value_backup = Hcalib.value;
+
+	setCameraIntrinsics(cameraId, K(0, 0), K(1, 1), K(0, 2), K(1, 2));
+}
+
+void FullSystem::loadSensorPrameters(int cameraId, const std::string &pathSensorParameter)
 {
 	std::ifstream infile;
     infile.open(pathSensorParameter.c_str());
 
     int numLine = 1;
+	CameraCalibration calibration = getCameraCalibration(cameraId);
+	calibration.fx = Hcalib.fxl();
+	calibration.fy = Hcalib.fyl();
+	calibration.cx = Hcalib.cxl();
+	calibration.cy = Hcalib.cyl();
+	Eigen::Matrix3d Rlc;
+	Eigen::Vector3d tlc;
 
     while(!infile.eof())
     {
@@ -87,7 +687,6 @@ void FullSystem::loadSensorPrameters(const std::string &pathSensorParameter)
         getline(infile,s);
         if(!s.empty() && numLine == 1)
         {
-            fx = Hcalib.fxl(); fy = Hcalib.fyl(); cx = Hcalib.cxl(); cy = Hcalib.cyl();
             numLine++;
         }
         else if(!s.empty() && numLine == 2)
@@ -109,6 +708,8 @@ void FullSystem::loadSensorPrameters(const std::string &pathSensorParameter)
         	std::stringstream ss;
             ss << s;
             ss >> Rlc(2, 0); ss >> Rlc(2, 1); ss >> Rlc(2, 2); ss >> tlc(2, 0);
+            calibration.T_LC = SE3(Rlc, tlc);
+            setCameraCalibration(cameraId, calibration);
             numLine++;
         }
     }
@@ -177,12 +778,7 @@ void FullSystem::initializationValue()
 
 	assert(retstat!=293847);
 
-	selectionMap = new float[wG[0]*hG[0]];
-
-	coarseDistanceMap = new CoarseDistanceMap(wG[0], hG[0]);
-	coarseTracker = new CoarseTracker(wG[0], hG[0]);
-	coarseTracker_forNewKF = new CoarseTracker(wG[0], hG[0]);
-	coarseInitializer = new CoarseInitializer(wG[0], hG[0]);
+	initializeVisualState(visualState);
 	pixelSelector = new PixelSelector(wG[0], hG[0]);
 
 	statistics_lastNumOptIts=0;
@@ -194,24 +790,9 @@ void FullSystem::initializationValue()
 	statistics_numMargResFwd = 0;
 	statistics_numMargResBwd = 0;
 
-	lastCoarseRMSE.setConstant(100);
-
-	currentMinActDist=2;
-	initialized=false;
-
-
-	ef = new EnergyFunctional();
-	ef->red = &this->treadReduce;
-
-	isLost=false;
-	initFailed=false;
-
-
-	needNewKFAfter = -1;
-
 	linearizeOperation=true;
 	runMapping=true;
-	mappingThread = boost::thread(&FullSystem::mappingLoop, this);
+	mappingThread = boost::thread(static_cast<void (FullSystem::*)()>(&FullSystem::mappingLoop), this);
 	lastRefStopID=0;
 
 
@@ -255,35 +836,78 @@ void FullSystem::printResult(std::string file)
 	boost::unique_lock<boost::mutex> lock(trackMutex);
 	boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
 
-	std::ofstream myfile;
-	myfile.open (file.c_str());
-	//myfile << std::setprecision(15);
-
-	for(FrameShell* s : allFrameHistory)
+	std::vector<FrameShell*> validShells;
+	if(rigPoseSnapshots.empty())
 	{
-		if(!s->poseValid) continue;
+		std::vector<FrameShell*> shells;
+		for(std::map<int, VisualState*>::const_iterator it = visualStatesByCamera.begin();
+			it != visualStatesByCamera.end();
+			++it)
+		{
+			for(FrameShell* s : it->second->allFrameHistory)
+				shells.push_back(s);
+		}
 
-		Eigen::Quaterniond q;
+		std::sort(shells.begin(), shells.end(), [](const FrameShell* a, const FrameShell* b) {
+			return a->timestamp < b->timestamp;
+		});
 
-	    q.w() = s->camToWorld.so3().unit_quaternion().w();
-	    q.x() = s->camToWorld.so3().unit_quaternion().x();
-	    q.y() = s->camToWorld.so3().unit_quaternion().y();
-	    q.z() = s->camToWorld.so3().unit_quaternion().z();
+		for(FrameShell* s : shells)
+		{
+			if(!s->poseValid) continue;
+			if(!s->updatesRigPose) continue;
+			validShells.push_back(s);
+		}
 
-	    Eigen::Matrix3d R = q.toRotationMatrix();
-	    Eigen::Vector3d t = s->camToWorld.translation();
+		if(validShells.empty())
+			return;
+	}
 
-		myfile << std::fixed << (float)R(0, 0) << " " << (float)R(0, 1) << " " << (float)R(0, 2) << " " << (float)t(0, 0) <<
-			" " << (float)R(1, 0) << " " << (float)R(1, 1) << " " << (float)R(1, 2) << " " << (float)t(1, 0) <<
-			" " << (float)R(2, 0) << " " << (float)R(2, 1) << " " << (float)R(2, 2) << " " << (float)t(2, 0) << "\n";
+	const std::string timestampFile = withSuffixBeforeExtension(file, "_timestamps");
+	const std::string activeCameraFile = withSuffixBeforeExtension(file, "_active_camera");
+	const std::string tumFile = replaceExtension(file, ".tum");
+	std::ofstream myfile;
+	std::ofstream timefile;
+	std::ofstream camerafile;
+	std::ofstream tumfile;
+	myfile.open(file.c_str());
+	timefile.open(timestampFile.c_str());
+	camerafile.open(activeCameraFile.c_str());
+	tumfile.open(tumFile.c_str());
+
+	if(!rigPoseSnapshots.empty())
+	{
+		for(const RigPoseSnapshot& snapshot : rigPoseSnapshots)
+		{
+			writeTrajectoryEntry(myfile, timefile, tumfile, camerafile, snapshot.timestamp, snapshot.cameraId, snapshot.T_WL);
+		}
+		myfile.close();
+		timefile.close();
+		camerafile.close();
+		tumfile.close();
+		return;
+	}
+
+	for(FrameShell* s : validShells)
+	{
+		const SE3 T_WL = getRigPoseForFrameShell(s);
+		writeTrajectoryEntry(myfile, timefile, tumfile, camerafile, s->timestamp, s->cameraId, T_WL);
 	}
 	myfile.close();
+	timefile.close();
+	camerafile.close();
+	tumfile.close();
 }
 
 Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
 {
+	return trackNewCoarse(visualState, fh);
+}
 
-	assert(allFrameHistory.size() > 0);
+Vec4 FullSystem::trackNewCoarse(VisualState& visualState, FrameHessian* fh)
+{
+
+	assert(visualState.allFrameHistory.size() > 0);
 	// set pose initialization.
 
     for(IOWrap::Output3DWrapper* ow : outputWrapper)
@@ -291,13 +915,13 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
 
 
 
-	FrameHessian* lastF = coarseTracker->lastRef;
+	FrameHessian* lastF = visualState.coarseTracker->lastRef;
 
 	AffLight aff_last_2_l = AffLight(0,0);
 	std::vector<SE3,Eigen::aligned_allocator<SE3>> lastF_2_fh_tries;
 
-	if(allFrameHistory.size() == 2) {
-		initializeFromInitializer(fh);
+	if(visualState.allFrameHistory.size() == 2) {
+		initializeFromInitializer(visualState, fh);
 
 		lastF_2_fh_tries.push_back(SE3(Eigen::Matrix<double, 3, 3>::Identity(), Eigen::Matrix<double,3,1>::Zero() ));
 
@@ -331,15 +955,15 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
             lastF_2_fh_tries.push_back(SE3(Sophus::Quaterniond(1,rotDelta,rotDelta,rotDelta), Vec3(0,0,0)));	// assume constant motion.
         }
 		
-		coarseTracker->makeK(&Hcalib);
-		coarseTracker->setCTRefForFirstFrame(frameHessians);
+		visualState.coarseTracker->makeK(&Hcalib);
+		visualState.coarseTracker->setCTRefForFirstFrame(visualState.frameHessians);
 
-		lastF = coarseTracker->lastRef;
+		lastF = visualState.coarseTracker->lastRef;
 	}
 	else
 	{
-		FrameShell* slast = allFrameHistory[allFrameHistory.size()-2];
-		FrameShell* sprelast = allFrameHistory[allFrameHistory.size()-3];
+		FrameShell* slast = visualState.allFrameHistory[visualState.allFrameHistory.size()-2];
+		FrameShell* sprelast = visualState.allFrameHistory[visualState.allFrameHistory.size()-3];
 		SE3 slast_2_sprelast;
 		SE3 lastF_2_slast;
 		{	
@@ -416,13 +1040,13 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
 		AffLight aff_g2l_this = aff_last_2_l;
 		SE3 lastF_2_fh_this = lastF_2_fh_tries[i];
 		
-		bool trackingIsGood = coarseTracker->trackNewestCoarse(
+			bool trackingIsGood = visualState.coarseTracker->trackNewestCoarse(
 				fh, lastF_2_fh_this, aff_g2l_this,
 				pyrLevelsUsed-1,
 				achievedRes);	// in each level has to be at least as good as the last try.
 		tryIterations++;
 
-		if(i != 0)
+		if(i != 0 && !setting_debugout_runquiet)
 		{
 			printf("RE-TRACK ATTEMPT %d with initOption %d and start-lvl %d (ab %f %f): %f %f %f %f %f -> %f %f %f %f %f \n",
 					i,
@@ -433,17 +1057,17 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
 					achievedRes[2],
 					achievedRes[3],
 					achievedRes[4],
-					coarseTracker->lastResiduals[0],
-					coarseTracker->lastResiduals[1],
-					coarseTracker->lastResiduals[2],
-					coarseTracker->lastResiduals[3],
-					coarseTracker->lastResiduals[4]);
+					visualState.coarseTracker->lastResiduals[0],
+					visualState.coarseTracker->lastResiduals[1],
+					visualState.coarseTracker->lastResiduals[2],
+					visualState.coarseTracker->lastResiduals[3],
+					visualState.coarseTracker->lastResiduals[4]);
 		}
 
 		// do we have a new winner?
-		if(trackingIsGood && std::isfinite((float)coarseTracker->lastResiduals[0]) && !(coarseTracker->lastResiduals[0] >=  achievedRes[0]))
+		if(trackingIsGood && std::isfinite((float)visualState.coarseTracker->lastResiduals[0]) && !(visualState.coarseTracker->lastResiduals[0] >=  achievedRes[0]))
 		{
-			flowVecs = coarseTracker->lastFlowIndicators;
+			flowVecs = visualState.coarseTracker->lastFlowIndicators;
 			aff_g2l = aff_g2l_this;
 			lastF_2_fh = lastF_2_fh_this;
 			haveOneGood = true;
@@ -454,45 +1078,53 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
 		{
 			for(int i=0;i<5;i++)
 			{
-				if(!std::isfinite((float)achievedRes[i]) || achievedRes[i] > coarseTracker->lastResiduals[i])	// take over if achievedRes is either bigger or NAN.
-					achievedRes[i] = coarseTracker->lastResiduals[i];
+					if(!std::isfinite((float)achievedRes[i]) || achievedRes[i] > visualState.coarseTracker->lastResiduals[i])	// take over if achievedRes is either bigger or NAN.
+						achievedRes[i] = visualState.coarseTracker->lastResiduals[i];
 			}
 		}
 
-        if(haveOneGood &&  achievedRes[0] < lastCoarseRMSE[0]*setting_reTrackThreshold)
+        if(haveOneGood &&  achievedRes[0] < visualState.lastCoarseRMSE[0]*setting_reTrackThreshold)
             break;
 
 	}
 
 	if(!haveOneGood)
 	{
-        printf("BIG ERROR! tracking failed entirely. Take predictred pose and hope we may somehow recover.\n");
-		flowVecs = Vec3(0,0,0);
-		aff_g2l = aff_last_2_l;
-		lastF_2_fh = lastF_2_fh_tries[0];
+		if(!setting_debugout_runquiet)
+			printf("BIG ERROR! tracking failed entirely. Reject frame.\n");
+		return Vec4(NAN, NAN, NAN, NAN);
 	}
 
-	lastCoarseRMSE = achievedRes;
+	visualState.lastCoarseRMSE = achievedRes;
+
+	if(!std::isfinite((float)achievedRes[0]) || achievedRes[0] > maxCoarseTrackingRMSE)
+	{
+		if(!setting_debugout_runquiet)
+			printf("Coarse tracking rejected: RMSE %.3f > %.3f.\n", achievedRes[0], maxCoarseTrackingRMSE);
+		return Vec4(NAN, NAN, NAN, NAN);
+	}
 
 	// no lock required, as fh is not used anywhere yet.
 	fh->shell->camToTrackingRef = lastF_2_fh.inverse();
 	fh->shell->trackingRef = lastF->shell;
 	fh->shell->aff_g2l = aff_g2l;
-	fh->shell->camToWorld = fh->shell->trackingRef->camToWorld * fh->shell->camToTrackingRef;
+	// Legacy tracking still propagates the camera pose T_WC through the visual chain.
+	fh->shell->setT_WC(fh->shell->trackingRef->getT_WC() * fh->shell->camToTrackingRef);
 
 	std::vector<std::pair<PointHessian*, Eigen::Vector2d> > overlap_pts;
-	Reprojector reprojector_ = Reprojector(&Hcalib, fh, frameHessians);
+	Reprojector reprojector_ = Reprojector(&Hcalib, fh, visualState.frameHessians);
 	reprojector_.reprojectMap(fh, overlap_pts);
 
-	SE3 curToWorld = fh->shell->camToWorld;
-	coarseTracker->structPoseEstimation(curToWorld, overlap_pts);
-	fh->shell->camToWorld = curToWorld;
+	SE3 curToWorld = fh->shell->getT_WC();
+	visualState.coarseTracker->structPoseEstimation(curToWorld, overlap_pts);
+	fh->shell->setT_WC(curToWorld);
+	syncRigStateFromFrameShell(fh->shell);
 
-	SE3 Twl = fh->shell->trackingRef->camToWorld;
+	SE3 Twl = fh->shell->trackingRef->getT_WC();
 	fh->shell->camToTrackingRef = Twl.inverse() * curToWorld;
 
-	if(coarseTracker->firstCoarseRMSE < 0)
-		coarseTracker->firstCoarseRMSE = achievedRes[0];
+	if(visualState.coarseTracker->firstCoarseRMSE < 0)
+		visualState.coarseTracker->firstCoarseRMSE = achievedRes[0];
 
     if(!setting_debugout_runquiet)
         printf("Coarse Tracker tracked ab = %f %f (exp %f). Res %f!\n", aff_g2l.a, aff_g2l.b, fh->ab_exposure, achievedRes[0]);
@@ -518,6 +1150,11 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian* fh)
 
 void FullSystem::traceNewCoarse(FrameHessian* fh)
 {
+	traceNewCoarse(visualState, fh);
+}
+
+void FullSystem::traceNewCoarse(VisualState& visualState, FrameHessian* fh)
+{
 	boost::unique_lock<boost::mutex> lock(mapMutex);
 
 	int trace_total=0, trace_good=0, trace_oob=0, trace_out=0, trace_skip=0, trace_badcondition=0, trace_uninitialized=0;
@@ -528,7 +1165,7 @@ void FullSystem::traceNewCoarse(FrameHessian* fh)
 	K(0,2) = Hcalib.cxl();
 	K(1,2) = Hcalib.cyl();
 
-	for(FrameHessian* host : frameHessians)		// go through all active frames
+	for(FrameHessian* host : visualState.frameHessians)		// go through all active frames
 	{
 
 		SE3 hostToNew = fh->PRE_worldToCam * host->PRE_camToWorld;
@@ -554,60 +1191,66 @@ void FullSystem::traceNewCoarse(FrameHessian* fh)
 
 //@ 处理挑选出来待激活的点
 void FullSystem::activatePointsMT_Reductor(
+		VisualState& visualState,
 		std::vector<PointHessian*>* optimized,
 		std::vector<ImmaturePoint*>* toOptimize,
 		int min, int max, Vec10* stats, int tid)
 {
-	ImmaturePointTemporaryResidual* tr = new ImmaturePointTemporaryResidual[frameHessians.size()];
+	ImmaturePointTemporaryResidual* tr = new ImmaturePointTemporaryResidual[visualState.frameHessians.size()];
 	for(int k=min;k<max;k++)
 	{
-		(*optimized)[k] = optimizeImmaturePoint((*toOptimize)[k],1,tr);
+		(*optimized)[k] = optimizeImmaturePoint(visualState, (*toOptimize)[k],1,tr);
 	}
 	delete[] tr;
 }
 
 void FullSystem::activatePointsMT()
 {
-	if(ef->nPoints < setting_desiredPointDensity*0.66)
-		currentMinActDist -= 0.8;
-	if(ef->nPoints < setting_desiredPointDensity*0.8)
-		currentMinActDist -= 0.5;
-	else if(ef->nPoints < setting_desiredPointDensity*0.9)
-		currentMinActDist -= 0.2;
-	else if(ef->nPoints < setting_desiredPointDensity)
-		currentMinActDist -= 0.1;
+	activatePointsMT(visualState);
+}
 
-	if(ef->nPoints > setting_desiredPointDensity*1.5)
-		currentMinActDist += 0.8;
-	if(ef->nPoints > setting_desiredPointDensity*1.3)
-		currentMinActDist += 0.5;
-	if(ef->nPoints > setting_desiredPointDensity*1.15)
-		currentMinActDist += 0.2;
-	if(ef->nPoints > setting_desiredPointDensity)
-		currentMinActDist += 0.1;
+void FullSystem::activatePointsMT(VisualState& visualState)
+{
+	if(visualState.ef->nPoints < setting_desiredPointDensity*0.66)
+		visualState.currentMinActDist -= 0.8;
+	if(visualState.ef->nPoints < setting_desiredPointDensity*0.8)
+		visualState.currentMinActDist -= 0.5;
+	else if(visualState.ef->nPoints < setting_desiredPointDensity*0.9)
+		visualState.currentMinActDist -= 0.2;
+	else if(visualState.ef->nPoints < setting_desiredPointDensity)
+		visualState.currentMinActDist -= 0.1;
 
-	if(currentMinActDist < 0) currentMinActDist = 0;
-	if(currentMinActDist > 4) currentMinActDist = 4;
+	if(visualState.ef->nPoints > setting_desiredPointDensity*1.5)
+		visualState.currentMinActDist += 0.8;
+	if(visualState.ef->nPoints > setting_desiredPointDensity*1.3)
+		visualState.currentMinActDist += 0.5;
+	if(visualState.ef->nPoints > setting_desiredPointDensity*1.15)
+		visualState.currentMinActDist += 0.2;
+	if(visualState.ef->nPoints > setting_desiredPointDensity)
+		visualState.currentMinActDist += 0.1;
+
+	if(visualState.currentMinActDist < 0) visualState.currentMinActDist = 0;
+	if(visualState.currentMinActDist > 4) visualState.currentMinActDist = 4;
 
     if(!setting_debugout_runquiet)
         printf("SPARSITY:  MinActDist %f (need %d points, have %d points)!\n",
-                currentMinActDist, (int)(setting_desiredPointDensity), ef->nPoints);
+                visualState.currentMinActDist, (int)(setting_desiredPointDensity), visualState.ef->nPoints);
 
 
 
-	FrameHessian* newestHs = frameHessians.back();
+	FrameHessian* newestHs = visualState.frameHessians.back();
 
 	// make dist map.
-	coarseDistanceMap->makeK(&Hcalib);
-	coarseDistanceMap->makeDistanceMap(frameHessians, newestHs);
+	visualState.coarseDistanceMap->makeK(&Hcalib);
+	visualState.coarseDistanceMap->makeDistanceMap(visualState.frameHessians, newestHs);
 
 	std::vector<ImmaturePoint*> toOptimize; toOptimize.reserve(20000);
 
-	for(FrameHessian* host : frameHessians)		// go through all active frames
+	for(FrameHessian* host : visualState.frameHessians)		// go through all active frames
 	{
 		SE3 fhToNew = newestHs->PRE_worldToCam * host->PRE_camToWorld;
-		Mat33f KRKi = (coarseDistanceMap->K[1] * fhToNew.rotationMatrix().cast<float>() * coarseDistanceMap->Ki[0]);
-		Vec3f Kt = (coarseDistanceMap->K[1] * fhToNew.translation().cast<float>());
+		Mat33f KRKi = (visualState.coarseDistanceMap->K[1] * fhToNew.rotationMatrix().cast<float>() * visualState.coarseDistanceMap->Ki[0]);
+		Vec3f Kt = (visualState.coarseDistanceMap->K[1] * fhToNew.translation().cast<float>());
 
 		for(unsigned int i=0;i<host->immaturePoints.size();i+=1)
 		{
@@ -654,11 +1297,11 @@ void FullSystem::activatePointsMT()
 
 			if((u > 0 && v > 0 && u < wG[1] && v < hG[1]))
 			{
-				float dist = coarseDistanceMap->fwdWarpedIDDistFinal[u+wG[1]*v] + (ptp[0]-floorf((float)(ptp[0])));
+				float dist = visualState.coarseDistanceMap->fwdWarpedIDDistFinal[u+wG[1]*v] + (ptp[0]-floorf((float)(ptp[0])));
 
-				if(dist>=currentMinActDist* ph->my_type)
+				if(dist>=visualState.currentMinActDist* ph->my_type)
 				{
-					coarseDistanceMap->addIntoDistFinal(u,v);
+					visualState.coarseDistanceMap->addIntoDistFinal(u,v);
 					toOptimize.push_back(ph);
 				}
 			}
@@ -673,11 +1316,11 @@ void FullSystem::activatePointsMT()
 	std::vector<PointHessian*> optimized; optimized.resize(toOptimize.size());
 
 	if(multiThreading)
-		treadReduce.reduce(boost::bind(&FullSystem::activatePointsMT_Reductor, this, &optimized, &toOptimize, _1, _2, _3, _4), 0, toOptimize.size(), 50);
+		treadReduce.reduce(boost::bind(&FullSystem::activatePointsMT_Reductor, this, boost::ref(visualState), &optimized, &toOptimize, _1, _2, _3, _4), 0, toOptimize.size(), 50);
 
 	else
 	{
-		activatePointsMT_Reductor(&optimized, &toOptimize, 0, toOptimize.size(), 0, 0);
+		activatePointsMT_Reductor(visualState, &optimized, &toOptimize, 0, toOptimize.size(), 0, 0);
 	}
 
 	for(unsigned k=0;k<toOptimize.size();k++)
@@ -689,9 +1332,9 @@ void FullSystem::activatePointsMT()
 		{
 			newpoint->host->immaturePoints[ph->idxInImmaturePoints]=0;
 			newpoint->host->pointHessians.push_back(newpoint);
-			ef->insertPoint(newpoint);
+			visualState.ef->insertPoint(newpoint);
 			for(PointFrameResidual* r : newpoint->residuals)
-				ef->insertResidual(r);
+				visualState.ef->insertResidual(r);
 			assert(newpoint->efPoint != 0);
 			delete ph;
 		}
@@ -706,7 +1349,7 @@ void FullSystem::activatePointsMT()
 		}
 	}
 
-	for(FrameHessian* host : frameHessians)
+	for(FrameHessian* host : visualState.frameHessians)
 	{
 		for(int i=0;i<(int)host->immaturePoints.size();i++)
 		{
@@ -729,24 +1372,29 @@ void FullSystem::activatePointsOldFirst()
 
 void FullSystem::flagPointsForRemoval()
 {
+	flagPointsForRemoval(visualState);
+}
+
+void FullSystem::flagPointsForRemoval(VisualState& visualState)
+{
 	assert(EFIndicesValid);
 
 	std::vector<FrameHessian*> fhsToKeepPoints;
 	std::vector<FrameHessian*> fhsToMargPoints;
 
 	{
-		for(int i=((int)frameHessians.size())-1;i>=0 && i >= ((int)frameHessians.size());i--)
-			if(!frameHessians[i]->flaggedForMarginalization) fhsToKeepPoints.push_back(frameHessians[i]);
+		for(int i=((int)visualState.frameHessians.size())-1;i>=0 && i >= ((int)visualState.frameHessians.size());i--)
+			if(!visualState.frameHessians[i]->flaggedForMarginalization) fhsToKeepPoints.push_back(visualState.frameHessians[i]);
 
-		for(int i=0; i< (int)frameHessians.size();i++)
-			if(frameHessians[i]->flaggedForMarginalization) fhsToMargPoints.push_back(frameHessians[i]);
+		for(int i=0; i< (int)visualState.frameHessians.size();i++)
+			if(visualState.frameHessians[i]->flaggedForMarginalization) fhsToMargPoints.push_back(visualState.frameHessians[i]);
 	}
 
 	int flag_oob=0, flag_in=0, flag_inin=0, flag_nores=0;
 
-	for(FrameHessian* host : frameHessians)
+	for(FrameHessian* host : visualState.frameHessians)
 	{
-		if(host == frameHessians.back()) continue;
+		if(host == visualState.frameHessians.back()) continue;
 
 		for(unsigned int i=0;i<host->pointHessians.size();i++)
 		{
@@ -778,7 +1426,7 @@ void FullSystem::flagPointsForRemoval()
 
 						if(r->efResidual->isActive())
 						{
-							r->efResidual->fixLinearizationF(ef);
+							r->efResidual->fixLinearizationF(visualState.ef);
 							ngoodRes++;
 						}
 					}
@@ -821,91 +1469,158 @@ void FullSystem::flagPointsForRemoval()
 
 void FullSystem::addActiveFrame( ImageAndExposure* image, int id )
 {
-    if(isLost) return;
+	addActiveFrame(CameraInput(rigState.activeCameraId, image, id));
+}
+
+void FullSystem::addActiveFrame(const CameraInput& cameraInput)
+{
+	addActiveFrame(cameraInput, true);
+}
+
+void FullSystem::addActiveFrame(const CameraInput& cameraInput, bool updatesRigPose)
+{
+	addActiveFrame(ensureVisualState(cameraInput.cameraId), cameraInput, updatesRigPose);
+}
+
+void FullSystem::addActiveFrame(VisualState& visualState, ImageAndExposure* image, int id )
+{
+	addActiveFrame(visualState, CameraInput(rigState.activeCameraId, image, id));
+}
+
+void FullSystem::addActiveFrame(VisualState& visualState, const CameraInput& cameraInput)
+{
+	addActiveFrame(visualState, cameraInput, true);
+}
+
+void FullSystem::addActiveFrame(VisualState& visualState, const CameraInput& cameraInput, bool updatesRigPose)
+{
+	setActiveCameraId(cameraInput.cameraId);
+
+	ImageAndExposure* image = cameraInput.image;
+	int id = cameraInput.frameId;
+
+    if(visualState.isLost) return;
 	boost::unique_lock<boost::mutex> lock(trackMutex);
 
 	FrameHessian* fh = new FrameHessian();
+	fh->cameraId = cameraInput.cameraId;
 	FrameShell* shell = new FrameShell();
-	shell->camToWorld = SE3(); 		// no lock required, as fh is not used anywhere yet.
+	shell->cameraId = cameraInput.cameraId;
+	shell->updatesRigPose = updatesRigPose;
+	const bool anchorShellToRig =
+		updatesRigPose &&
+		rigPoseValid &&
+		rigState.hasCamera(cameraInput.cameraId);
+	shell->setT_WC(anchorShellToRig ? rigState.getT_WC(cameraInput.cameraId) : SE3());
 	shell->aff_g2l = AffLight(0,0);
-    shell->marginalizedAt = shell->id = allFrameHistory.size();
+    shell->marginalizedAt = shell->id = visualState.allFrameHistory.size();
     shell->timestamp = image->timestamp;
     shell->incoming_id = id;
 	fh->shell = shell;
-	allFrameHistory.push_back(shell);
+	fh->lidarProjection = cameraInput.lidarProjection;
+	visualState.allFrameHistory.push_back(shell);
 
-	std::cout << std::fixed << "current time = " << shell->timestamp << std::endl;
+	std::cout << std::fixed << "current time = " << shell->timestamp
+			  << " camera = " << cameraInput.cameraId
+			  << (updatesRigPose ? "" : " warmup")
+			  << " score = ";
+	if(cameraInput.selectionScoreValid)
+		std::cout << cameraInput.selectionScore;
+	else
+		std::cout << "nan";
+	std::cout << " lidar_points = " << cameraInput.lidarProjection.cloudPixels.size()
+			  << " sync_error = " << fabs(shell->timestamp - cameraInput.lidarProjection.lidarTimestamp)
+			  << std::endl;
 
 	fh->ab_exposure = image->exposure_time;
     fh->makeImages(image->image, &Hcalib);
 
-	if(!initialized)
+	if(!visualState.initialized)
 	{
-		if(coarseInitializer->frameID < 0)
+		if(visualState.coarseInitializer->frameID < 0)
 		{
-			coarseInitializer->setFirstFromLidar(&Hcalib, fh, this);
-			initialized = true;
+			if(!visualState.coarseInitializer->setFirstFromLidar(&Hcalib, fh, this, fh->lidarProjection))
+			{
+				visualState.allFrameHistory.pop_back();
+				delete shell;
+				fh->shell = 0;
+				delete fh;
+				return;
+			}
+			visualState.initialized = true;
 		}
 		return;
 	}
 	else	// do front-end operation.
 	{
-		if(coarseTracker_forNewKF->refFrameID > coarseTracker->refFrameID)
+		if(visualState.coarseTracker_forNewKF->refFrameID > visualState.coarseTracker->refFrameID)
 		{
 			boost::unique_lock<boost::mutex> crlock(coarseTrackerSwapMutex);
-			CoarseTracker* tmp = coarseTracker;
-			coarseTracker=coarseTracker_forNewKF; 
-			coarseTracker_forNewKF=tmp;
+			CoarseTracker* tmp = visualState.coarseTracker;
+			visualState.coarseTracker=visualState.coarseTracker_forNewKF; 
+			visualState.coarseTracker_forNewKF=tmp;
 		}
 
-		Vec4 tres = trackNewCoarse(fh);
+		Vec4 tres = trackNewCoarse(visualState, fh);
 		if(!std::isfinite((double)tres[0]) || !std::isfinite((double)tres[1]) || !std::isfinite((double)tres[2]) || !std::isfinite((double)tres[3]))
         {
-            printf("Initial Tracking failed: LOST!\n");
-			isLost=true;
+            if(!setting_debugout_runquiet)
+                printf("Tracking rejected frame %d.\n", id);
+			visualState.allFrameHistory.pop_back();
+			delete shell;
+			fh->shell = 0;
+			delete fh;
             return;
         }
 
 		bool needToMakeKF = false;
 		if(setting_keyframesPerSecond > 0)
 		{
-			needToMakeKF = allFrameHistory.size()== 1 ||
-					(fh->shell->timestamp - allKeyFramesHistory.back()->timestamp) > 0.95f/setting_keyframesPerSecond;
+			needToMakeKF = visualState.allFrameHistory.size()== 1 ||
+					(fh->shell->timestamp - visualState.allKeyFramesHistory.back()->timestamp) > 0.95f/setting_keyframesPerSecond;
 		}
 		else
 		{
-			Vec2 refToFh=AffLight::fromToVecExposure(coarseTracker->lastRef->ab_exposure, fh->ab_exposure,
-					coarseTracker->lastRef_aff_g2l, fh->shell->aff_g2l);
+			Vec2 refToFh=AffLight::fromToVecExposure(visualState.coarseTracker->lastRef->ab_exposure, fh->ab_exposure,
+					visualState.coarseTracker->lastRef_aff_g2l, fh->shell->aff_g2l);
 
 			// BRIGHTNESS CHECK
-			needToMakeKF = allFrameHistory.size()== 1 ||
+			needToMakeKF = visualState.allFrameHistory.size()== 1 ||
 					setting_kfGlobalWeight*setting_maxShiftWeightT *  sqrtf((double)tres[1]) / (wG[0]+hG[0]) +  
 					setting_kfGlobalWeight*setting_maxShiftWeightR *  sqrtf((double)tres[2]) / (wG[0]+hG[0]) + 	
 					setting_kfGlobalWeight*setting_maxShiftWeightRT * sqrtf((double)tres[3]) / (wG[0]+hG[0]) +	
 					setting_kfGlobalWeight*setting_maxAffineWeight * fabs(logf((float)refToFh[0])) > 1 ||
-					2*coarseTracker->firstCoarseRMSE < tres[0];
+					2*visualState.coarseTracker->firstCoarseRMSE < tres[0];
 
 		}
 
-		if(ignoreKF && fh->shell->timestamp - allKeyFramesHistory.back()->timestamp <= 0.15)
+		if(ignoreKF && fh->shell->timestamp - visualState.allKeyFramesHistory.back()->timestamp <= 0.15)
 			needToMakeKF = false;
 
-        for(IOWrap::Output3DWrapper* ow : outputWrapper)
-            ow->publishCamPose(fh->shell, &Hcalib);
+        if(fh->shell->updatesRigPose)
+        {
+            for(IOWrap::Output3DWrapper* ow : outputWrapper)
+                ow->publishCamPose(fh->shell, &Hcalib);
+        }
 
 		lock.unlock();
-		deliverTrackedFrame(fh, needToMakeKF);
+		deliverTrackedFrame(visualState, fh, needToMakeKF);
 		return;
 	}
 }
 
 void FullSystem::deliverTrackedFrame(FrameHessian* fh, bool needKF)
 {
+	deliverTrackedFrame(visualState, fh, needKF);
+}
+
+void FullSystem::deliverTrackedFrame(VisualState& visualState, FrameHessian* fh, bool needKF)
+{
 
 	//! 顺序执行
 	if(linearizeOperation) 
 	{
-		if(goStepByStep && lastRefStopID != coarseTracker->refFrameID)
+		if(goStepByStep && lastRefStopID != visualState.coarseTracker->refFrameID)
 		{
 			MinimalImageF3 img(wG[0], hG[0], fh->dI);
 			IOWrap::displayImage("frameToTrack", &img);
@@ -915,23 +1630,23 @@ void FullSystem::deliverTrackedFrame(FrameHessian* fh, bool needKF)
 				if(k==' ') break;
 				handleKey( k );
 			}
-			lastRefStopID = coarseTracker->refFrameID;
+			lastRefStopID = visualState.coarseTracker->refFrameID;
 		}
 		else handleKey( IOWrap::waitKey(1) );
 
 
 
-		if(needKF) makeKeyFrame(fh);
-		else makeNonKeyFrame(fh);
+		if(needKF) makeKeyFrame(visualState, fh);
+		else makeNonKeyFrame(visualState, fh);
 	}
 	else
 	{
 		boost::unique_lock<boost::mutex> lock(trackMapSyncMutex);
 		unmappedTrackedFrames.push_back(fh);
-		if(needKF) needNewKFAfter=fh->shell->trackingRef->id;
+		if(needKF) visualState.needNewKFAfter=fh->shell->trackingRef->id;
 		trackedFrameSignal.notify_all();
 
-		while(coarseTracker_forNewKF->refFrameID == -1 && coarseTracker->refFrameID == -1 )
+		while(visualState.coarseTracker_forNewKF->refFrameID == -1 && visualState.coarseTracker->refFrameID == -1 )
 		{
 			mappedFrameSignal.wait(lock);
 		}
@@ -942,7 +1657,13 @@ void FullSystem::deliverTrackedFrame(FrameHessian* fh, bool needKF)
 
 void FullSystem::mappingLoop()
 {
+	mappingLoop(visualState);
+}
+
+void FullSystem::mappingLoop(VisualState& defaultVisualState)
+{
 	boost::unique_lock<boost::mutex> lock(trackMapSyncMutex);
+	(void)defaultVisualState;
 
 	while(runMapping)
 	{
@@ -954,13 +1675,14 @@ void FullSystem::mappingLoop()
 
 		FrameHessian* fh = unmappedTrackedFrames.front();
 		unmappedTrackedFrames.pop_front();
+		VisualState& visualState = getVisualState(fh->cameraId);
 
 
 		// guaranteed to make a KF for the very first two tracked frames.
-		if(allKeyFramesHistory.size() <= 2)
+		if(visualState.allKeyFramesHistory.size() <= 2)
 		{
 			lock.unlock();
-			makeKeyFrame(fh);
+			makeKeyFrame(visualState, fh);
 			lock.lock();
 			mappedFrameSignal.notify_all();
 			continue;
@@ -973,7 +1695,7 @@ void FullSystem::mappingLoop()
 		if(unmappedTrackedFrames.size() > 0) // if there are other frames to tracke, do that first.
 		{
 			lock.unlock();
-			makeNonKeyFrame(fh);
+			makeNonKeyFrame(visualState, fh);
 			lock.lock();
 
 			if(needToKetchupMapping && unmappedTrackedFrames.size() > 0)
@@ -983,8 +1705,8 @@ void FullSystem::mappingLoop()
 				{
 					boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
 					assert(fh->shell->trackingRef != 0);
-					fh->shell->camToWorld = fh->shell->trackingRef->camToWorld * fh->shell->camToTrackingRef;
-					fh->setEvalPT_scaled(fh->shell->camToWorld.inverse(),fh->shell->aff_g2l);
+					fh->shell->setT_WC(fh->shell->trackingRef->getT_WC() * fh->shell->camToTrackingRef);
+					fh->setT_WC_scaled(fh->shell->getT_WC(),fh->shell->aff_g2l);
 				}
 				delete fh;
 			}
@@ -992,17 +1714,17 @@ void FullSystem::mappingLoop()
 		}
 		else
 		{
-			if(setting_realTimeMaxKF || needNewKFAfter >= frameHessians.back()->shell->id)
+			if(setting_realTimeMaxKF || visualState.needNewKFAfter >= visualState.frameHessians.back()->shell->id)
 			{
 				lock.unlock();
-				makeKeyFrame(fh);
+				makeKeyFrame(visualState, fh);
 				needToKetchupMapping=false;
 				lock.lock();
 			}
 			else
 			{
 				lock.unlock();
-				makeNonKeyFrame(fh);
+				makeNonKeyFrame(visualState, fh);
 				lock.lock();
 			}
 		}
@@ -1024,41 +1746,51 @@ void FullSystem::blockUntilMappingIsFinished()
 
 void FullSystem::makeNonKeyFrame( FrameHessian* fh)
 {
+	makeNonKeyFrame(visualState, fh);
+}
+
+void FullSystem::makeNonKeyFrame(VisualState& visualState, FrameHessian* fh)
+{
 	// needs to be set by mapping thread. no lock required since we are in mapping thread.
 	{
 		boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
 		assert(fh->shell->trackingRef != 0);
 
-		fh->shell->camToWorld = fh->shell->trackingRef->camToWorld * fh->shell->camToTrackingRef;
-		fh->setEvalPT_scaled(fh->shell->camToWorld.inverse(),fh->shell->aff_g2l);
+		fh->shell->setT_WC(fh->shell->trackingRef->getT_WC() * fh->shell->camToTrackingRef);
+		fh->setT_WC_scaled(fh->shell->getT_WC(),fh->shell->aff_g2l);
 	}
 
-	traceNewCoarse(fh);
+	traceNewCoarse(visualState, fh);
 	delete fh;
 }
 
 void FullSystem::makeKeyFrame( FrameHessian* fh)
 {
+	makeKeyFrame(visualState, fh);
+}
+
+void FullSystem::makeKeyFrame(VisualState& visualState, FrameHessian* fh)
+{
 	// needs to be set by mapping thread
 	{
 		boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
 		assert(fh->shell->trackingRef != 0);
-		fh->shell->camToWorld = fh->shell->trackingRef->camToWorld * fh->shell->camToTrackingRef;
-		fh->setEvalPT_scaled(fh->shell->camToWorld.inverse(),fh->shell->aff_g2l);
+		fh->shell->setT_WC(fh->shell->trackingRef->getT_WC() * fh->shell->camToTrackingRef);
+		fh->setT_WC_scaled(fh->shell->getT_WC(),fh->shell->aff_g2l);
 	}
 
-	traceNewCoarse(fh);
+	traceNewCoarse(visualState, fh);
 
 	boost::unique_lock<boost::mutex> lock(mapMutex);
 
-	flagFramesForMarginalization(fh);
+	flagFramesForMarginalization(visualState, fh);
 
-	if(allKeyFramesHistory.size() >= 2)
+	if(visualState.allKeyFramesHistory.size() >= 2)
 	{
-		float timeLast = allKeyFramesHistory.back()->timestamp;
-		float timeLastLast = allKeyFramesHistory[allKeyFramesHistory.size() - 2]->timestamp;
-		Eigen::Vector3d tLast = allKeyFramesHistory.back()->camToWorld.translation();
-		Eigen::Vector3d tLastLast = allKeyFramesHistory[allKeyFramesHistory.size() - 2]->camToWorld.translation();
+		float timeLast = visualState.allKeyFramesHistory.back()->timestamp;
+		float timeLastLast = visualState.allKeyFramesHistory[visualState.allKeyFramesHistory.size() - 2]->timestamp;
+		Eigen::Vector3d tLast = visualState.allKeyFramesHistory.back()->getT_WC().translation();
+		Eigen::Vector3d tLastLast = visualState.allKeyFramesHistory[visualState.allKeyFramesHistory.size() - 2]->getT_WC().translation();
 		float distance = sqrt((tLast[0] - tLastLast[0]) * (tLast[0] - tLastLast[0]) + (tLast[1] - tLastLast[1]) * (tLast[1] - tLastLast[1]) + 
 			(tLast[2] - tLastLast[2]) * (tLast[2] - tLastLast[2]));
 		float speed = distance / (timeLast - timeLastLast);
@@ -1069,22 +1801,22 @@ void FullSystem::makeKeyFrame( FrameHessian* fh)
 			ignoreKF = false;
 	}
 
-	fh->idx = frameHessians.size();
-	frameHessians.push_back(fh);
-	fh->frameID = allKeyFramesHistory.size();
-	allKeyFramesHistory.push_back(fh->shell);
-	ef->insertFrame(fh, &Hcalib);
+	fh->idx = visualState.frameHessians.size();
+	visualState.frameHessians.push_back(fh);
+	fh->frameID = visualState.allKeyFramesHistory.size();
+	visualState.allKeyFramesHistory.push_back(fh->shell);
+	visualState.ef->insertFrame(fh, &Hcalib);
 
-	setPrecalcValues();
+	setPrecalcValues(visualState);
 
-	makeNewTraces(fh, 0);
+	makeNewTraces(visualState, fh, 0, fh->lidarProjection);
 	for(ImmaturePoint* ph : fh->immaturePoints)
 		if(ph->isFromSensor == true){
 			ph->lastTraceStatus = ImmaturePointStatus::IPS_SKIPPED;
 		}
 
 	int numFwdResAdde=0;
-	for(FrameHessian* fh1 : frameHessians)
+	for(FrameHessian* fh1 : visualState.frameHessians)
 	{
 		if(fh1 == fh) continue;
 		for(PointHessian* ph : fh1->pointHessians)
@@ -1092,31 +1824,31 @@ void FullSystem::makeKeyFrame( FrameHessian* fh)
 			PointFrameResidual* r = new PointFrameResidual(ph, fh1, fh);
 			r->setState(ResState::IN);
 			ph->residuals.push_back(r);
-			ef->insertResidual(r);
+			visualState.ef->insertResidual(r);
 			ph->lastResiduals[1] = ph->lastResiduals[0];
 			ph->lastResiduals[0] = std::pair<PointFrameResidual*, ResState>(r, ResState::IN);
 			numFwdResAdde+=1;
 		}
 	}
 
-	activatePointsMT();
-	ef->makeIDX();
+	activatePointsMT(visualState);
+	visualState.ef->makeIDX();
 
-	for(int i = 0; i < frameHessians.size() - 1; i++)
+	for(int i = 0; i < visualState.frameHessians.size() - 1; i++)
 	{
 		std::vector<std::pair<PointHessian*, Eigen::Vector2d> > overlap_pts;
-		Reprojector reprojector_ = Reprojector(&Hcalib, fh, frameHessians);
-		reprojector_.backprojectMap(fh,frameHessians[i], overlap_pts);
+		Reprojector reprojector_ = Reprojector(&Hcalib, fh, visualState.frameHessians);
+		reprojector_.backprojectMap(fh,visualState.frameHessians[i], overlap_pts);
 	}
 
-	for(int i = frameHessians.size() - 2; i >= 0; i--)
+	for(int i = visualState.frameHessians.size() - 2; i >= 0; i--)
 	{
 		std::vector<std::pair<PointHessian*, Eigen::Vector2d> > overlap_pts;
-		Reprojector reprojector_ = Reprojector(&Hcalib, frameHessians[i], frameHessians);
-		reprojector_.backprojectMap(frameHessians[i],fh, overlap_pts);
+		Reprojector reprojector_ = Reprojector(&Hcalib, visualState.frameHessians[i], visualState.frameHessians);
+		reprojector_.backprojectMap(visualState.frameHessians[i],fh, overlap_pts);
 	}
 
-	for(FrameHessian* pf : frameHessians){
+	for(FrameHessian* pf : visualState.frameHessians){
 		int numMatch = 0;
 		for(PointHessian* pt : pf->pointHessians)
 			for(PointFrameResidual* pr : pt->residuals)
@@ -1130,83 +1862,93 @@ void FullSystem::makeKeyFrame( FrameHessian* fh)
 			}
 	}
 
-	fh->frameEnergyTH = frameHessians.back()->frameEnergyTH;
-	float rmse = optimize(setting_maxOptIterations);
+	fh->frameEnergyTH = visualState.frameHessians.back()->frameEnergyTH;
+	float rmse = optimize(visualState, setting_maxOptIterations);
 
-    if(isLost) return;
+    if(visualState.isLost) return;
 
-	removeOutliers();
+	removeOutliers(visualState);
 
 	{
 		boost::unique_lock<boost::mutex> crlock(coarseTrackerSwapMutex);
 
-		coarseTracker_forNewKF->makeK(&Hcalib);
-		coarseTracker_forNewKF->setCoarseTrackingRef(frameHessians);
+		visualState.coarseTracker_forNewKF->makeK(&Hcalib);
+		visualState.coarseTracker_forNewKF->setCoarseTrackingRef(visualState.frameHessians);
 
-        coarseTracker_forNewKF->debugPlotIDepthMap(&minIdJetVisTracker, &maxIdJetVisTracker, outputWrapper);
-        coarseTracker_forNewKF->debugPlotIDepthMapFloat(outputWrapper);
+        if(!setting_debugout_runquiet && !outputWrapper.empty())
+        {
+            visualState.coarseTracker_forNewKF->debugPlotIDepthMap(&minIdJetVisTracker, &maxIdJetVisTracker, outputWrapper);
+            visualState.coarseTracker_forNewKF->debugPlotIDepthMapFloat(outputWrapper);
+        }
 	}
 
-	debugPlot("post Optimize");
+	if(!setting_debugout_runquiet)
+		debugPlot("post Optimize");
 
-	flagPointsForRemoval();
-	ef->dropPointsF();
+	flagPointsForRemoval(visualState);
+	visualState.ef->dropPointsF();
 
 	getNullspaces(
-			ef->lastNullspaces_pose,
-			ef->lastNullspaces_scale,
-			ef->lastNullspaces_affA,
-			ef->lastNullspaces_affB);
+			visualState,
+			visualState.ef->lastNullspaces_pose,
+			visualState.ef->lastNullspaces_scale,
+			visualState.ef->lastNullspaces_affA,
+			visualState.ef->lastNullspaces_affB);
 
-	ef->marginalizePointsF();
+	visualState.ef->marginalizePointsF();
 
     for(IOWrap::Output3DWrapper* ow : outputWrapper)
     {
-        ow->publishGraph(ef->connectivityMap);
-        ow->publishKeyframes(frameHessians, false, &Hcalib);
+        ow->publishGraph(visualState.ef->connectivityMap);
+        ow->publishKeyframes(visualState.frameHessians, false, &Hcalib);
     }
 
-	for(unsigned int i=0;i<frameHessians.size();i++)
-		if(frameHessians[i]->flaggedForMarginalization)
-			{marginalizeFrame(frameHessians[i]); i=0;}
+	for(unsigned int i=0;i<visualState.frameHessians.size();i++)
+		if(visualState.frameHessians[i]->flaggedForMarginalization)
+			{marginalizeFrame(visualState, visualState.frameHessians[i]); i=0;}
 
-	printLogLine();
+	printLogLine(visualState);
 }
 
 void FullSystem::initializeFromInitializer(FrameHessian* newFrame)
 {
+	initializeFromInitializer(visualState, newFrame);
+}
+
+void FullSystem::initializeFromInitializer(VisualState& visualState, FrameHessian* newFrame)
+{
 	boost::unique_lock<boost::mutex> lock(mapMutex);
 
-	FrameHessian* firstFrame = coarseInitializer->firstFrame;
-	firstFrame->idx = frameHessians.size();
-	frameHessians.push_back(firstFrame);
-	firstFrame->frameID = allKeyFramesHistory.size();
-	allKeyFramesHistory.push_back(firstFrame->shell);
-	ef->insertFrame(firstFrame, &Hcalib);
-	setPrecalcValues();
+	FrameHessian* firstFrame = visualState.coarseInitializer->firstFrame;
+	firstFrame->idx = visualState.frameHessians.size();
+	visualState.frameHessians.push_back(firstFrame);
+	firstFrame->frameID = visualState.allKeyFramesHistory.size();
+	visualState.allKeyFramesHistory.push_back(firstFrame->shell);
+	visualState.ef->insertFrame(firstFrame, &Hcalib);
+	setPrecalcValues(visualState);
 
 	firstFrame->pointHessians.reserve(wG[0]*hG[0]*0.2f);
 	firstFrame->pointHessiansMarginalized.reserve(wG[0]*hG[0]*0.2f);
 	firstFrame->pointHessiansOut.reserve(wG[0]*hG[0]*0.2f);
 
 	float sumID=1e-5, numID=1e-5;
-	for(int i=0;i<coarseInitializer->numPoints[0];i++)
+	for(int i=0;i<visualState.coarseInitializer->numPoints[0];i++)
 	{
-		sumID += coarseInitializer->points[0][i].iR;
+		sumID += visualState.coarseInitializer->points[0][i].iR;
 		numID++;
 	}
 
-	float keepPercentage = setting_desiredPointDensity / coarseInitializer->numPoints[0];
+	float keepPercentage = setting_desiredPointDensity / visualState.coarseInitializer->numPoints[0];
 
     if(!setting_debugout_runquiet)
         printf("Initialization: keep %.1f%% (need %d, have %d)!\n", 100*keepPercentage,
-                (int)(setting_desiredPointDensity), coarseInitializer->numPoints[0] );
+                (int)(setting_desiredPointDensity), visualState.coarseInitializer->numPoints[0] );
 
-	for(int i=0;i<coarseInitializer->numPoints[0];i++)
+	for(int i=0;i<visualState.coarseInitializer->numPoints[0];i++)
 	{
 		if(rand()/(float)RAND_MAX > keepPercentage) continue;
 
-		Pnt* point = coarseInitializer->points[0]+i;
+		Pnt* point = visualState.coarseInitializer->points[0]+i;
 		ImmaturePoint* pt = new ImmaturePoint(point->u+0.5f,point->v+0.5f,firstFrame,point->my_type, &Hcalib);
 
 		if(point->isFromSensor == true)
@@ -1232,21 +1974,24 @@ void FullSystem::initializeFromInitializer(FrameHessian* newFrame)
 			ph->isFromSensor = false;
 
 		firstFrame->pointHessians.push_back(ph);
-		ef->insertPoint(ph);
+		visualState.ef->insertPoint(ph);
 	}
 
-	SE3 firstToNew = coarseInitializer->thisToNext;
+	SE3 firstToNew = visualState.coarseInitializer->thisToNext;
+	const bool alignInitializerToRig = newFrame->shell->updatesRigPose && rigPoseValid && rigState.hasCamera(newFrame->cameraId);
+	const SE3 newFrameT_WC = alignInitializerToRig ? rigState.getT_WC(newFrame->cameraId) : firstToNew.inverse();
+	const SE3 firstFrameT_WC = alignInitializerToRig ? newFrameT_WC * firstToNew : SE3();
 
 	// really no lock required, as we are initializing.
 	{
 		boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
-		firstFrame->shell->camToWorld = SE3();
+		firstFrame->shell->setT_WC(firstFrameT_WC);
 		firstFrame->shell->aff_g2l = AffLight(0,0);
 		firstFrame->setEvalPT_scaled(firstFrame->shell->camToWorld.inverse(),firstFrame->shell->aff_g2l);
 		firstFrame->shell->trackingRef=0;
 		firstFrame->shell->camToTrackingRef = SE3();
 
-		newFrame->shell->camToWorld = firstToNew.inverse();
+		newFrame->shell->setT_WC(newFrameT_WC);
 		newFrame->shell->aff_g2l = AffLight(0,0);
 		newFrame->setEvalPT_scaled(newFrame->shell->camToWorld.inverse(),newFrame->shell->aff_g2l);
 		newFrame->shell->trackingRef = firstFrame->shell;
@@ -1254,7 +1999,10 @@ void FullSystem::initializeFromInitializer(FrameHessian* newFrame)
 
 	}
 
-	initialized=true;
+	visualState.initialized=true;
+	syncRigStateFromFrameShell(newFrame->shell);
+	if(alignInitializerToRig && !setting_debugout_runquiet)
+		printf("aligned camera %d initializer to rig pose.\n", newFrame->cameraId);
 	printf("INITIALIZE FROM INITIALIZER (%d pts)!\n", (int)firstFrame->pointHessians.size());
 }
 
@@ -1270,9 +2018,10 @@ void FullSystem::setMask(cv::Mat &currentFrame, int Ku, int Kv)
     }
 }
 
-void FullSystem::makeNewTraces(FrameHessian* newFrame, float* gtDepth)
+void FullSystem::makeNewTraces(VisualState& visualState, FrameHessian* newFrame, float* gtDepth, const LidarProjectionResult& lidarProjection)
 {
-	std::vector<Eigen::Vector3d,Eigen::aligned_allocator<Eigen::Vector3d>> vCloudPixel = qCloudPixel.front();
+	std::vector<Eigen::Vector3d,Eigen::aligned_allocator<Eigen::Vector3d>> vCloudPixel = lidarProjection.cloudPixels;
+	float* selectionMapFromLidar = 0;
 
 	cv::Mat mask = cv::Mat::zeros(hG[0], wG[0], CV_8UC1);
 
@@ -1282,15 +2031,25 @@ void FullSystem::makeNewTraces(FrameHessian* newFrame, float* gtDepth)
 	int numPointLidar = 0;
 	int numPointMonocular = 0;
 
-	if(fabs(newFrame->shell->timestamp - qTimeLidarCloud.front()) < 0.01)
+	if(fabs(newFrame->shell->timestamp - lidarProjection.lidarTimestamp) < 0.01)
 	{
-		int lidarArea = (right - left) * (down - up);
+		int left = wG[0], right = -1, up = hG[0], down = -1;
+		for(size_t i = 0; i < vCloudPixel.size(); ++i)
+		{
+			const int u = static_cast<int>(vCloudPixel[i](0, 0));
+			const int v = static_cast<int>(vCloudPixel[i](1, 0));
+			if(u < left) left = u;
+			if(u > right) right = u;
+			if(v < up) up = v;
+			if(v > down) down = v;
+		}
+		int lidarArea = (right >= left && down >= up) ? (right - left) * (down - up) : 0;
 		int imageArea = wG[0] * hG[0];
-	    selectionMapFromLidar = new float[(qCloudPixel.front()).size()];
+	    selectionMapFromLidar = new float[vCloudPixel.size()];
 	    numPointLidar = pixelSelector->makeMapsFromLidar(newFrame, selectionMapFromLidar, ((float)lidarArea/(float)imageArea) * setting_desiredImmatureDensity, 1, false, 1, vCloudPixel);
 
 	    if(addFeaturePoint)
-	    	numPointMonocular = pixelSelector->makeMaps(newFrame, selectionMap, setting_desiredImmatureDensity);
+	    	numPointMonocular = pixelSelector->makeMaps(newFrame, visualState.selectionMap, setting_desiredImmatureDensity);
 	    numPointsTotal = numPointLidar + numPointMonocular;
 	}
 
@@ -1300,7 +2059,7 @@ void FullSystem::makeNewTraces(FrameHessian* newFrame, float* gtDepth)
 
 	float maxScore = -1000.0;
 
-	for(int i = 0; i < vCloudPixel.size(); i++)
+	for(int i = 0; selectionMapFromLidar != 0 && i < vCloudPixel.size(); i++)
 	{
 		if(selectionMapFromLidar[i]==0) continue;
 
@@ -1334,13 +2093,14 @@ void FullSystem::makeNewTraces(FrameHessian* newFrame, float* gtDepth)
 			impt->type = ImmaturePoint::EDGELET;
 	}
 
+	if(addFeaturePoint)
 	for(int y=patternPadding+1;y<hG[0]-patternPadding-2;y++)
 	for(int x=patternPadding+1;x<wG[0]-patternPadding-2;x++)
 	{
 		int i = x+y*wG[0];
-		if(selectionMap[i]==0) continue;
+		if(visualState.selectionMap[i]==0) continue;
 
-		ImmaturePoint* impt = new ImmaturePoint(x,y,newFrame, selectionMap[i], &Hcalib);
+		ImmaturePoint* impt = new ImmaturePoint(x,y,newFrame, visualState.selectionMap[i], &Hcalib);
 
 		impt->isFromSensor = false;
 
@@ -1357,57 +2117,67 @@ void FullSystem::makeNewTraces(FrameHessian* newFrame, float* gtDepth)
 
 void FullSystem::setPrecalcValues()
 {
-	for(FrameHessian* fh : frameHessians)
+	setPrecalcValues(visualState);
+}
+
+void FullSystem::setPrecalcValues(VisualState& visualState)
+{
+	for(FrameHessian* fh : visualState.frameHessians)
 	{
-		fh->targetPrecalc.resize(frameHessians.size());
-		for(unsigned int i=0;i<frameHessians.size();i++)
-			fh->targetPrecalc[i].set(fh, frameHessians[i], &Hcalib);
+		fh->targetPrecalc.resize(visualState.frameHessians.size());
+		for(unsigned int i=0;i<visualState.frameHessians.size();i++)
+			fh->targetPrecalc[i].set(fh, visualState.frameHessians[i], &Hcalib);
 	}
 
-	ef->setDeltaF(&Hcalib);
+	visualState.ef->setDeltaF(&Hcalib);
 }
 
 
 void FullSystem::printLogLine()
 {
-	if(frameHessians.size()==0) return;
+	printLogLine(visualState);
+}
+
+void FullSystem::printLogLine(VisualState& visualState)
+{
+	if(visualState.frameHessians.size()==0) return;
 
     if(!setting_debugout_runquiet)
         printf("LOG %d: %.3f fine. Res: %d A, %d L, %d M; (%'d / %'d) forceDrop. a=%f, b=%f. Window %d (%d)\n",
-                allKeyFramesHistory.back()->id,
+                visualState.allKeyFramesHistory.back()->id,
                 statistics_lastFineTrackRMSE,
-                ef->resInA,
-                ef->resInL,
-                ef->resInM,
+                visualState.ef->resInA,
+                visualState.ef->resInL,
+                visualState.ef->resInM,
                 (int)statistics_numForceDroppedResFwd,
                 (int)statistics_numForceDroppedResBwd,
-                allKeyFramesHistory.back()->aff_g2l.a,
-                allKeyFramesHistory.back()->aff_g2l.b,
-                frameHessians.back()->shell->id - frameHessians.front()->shell->id,
-                (int)frameHessians.size());
+                visualState.allKeyFramesHistory.back()->aff_g2l.a,
+                visualState.allKeyFramesHistory.back()->aff_g2l.b,
+                visualState.frameHessians.back()->shell->id - visualState.frameHessians.front()->shell->id,
+                (int)visualState.frameHessians.size());
 
 
 	if(!setting_logStuff) return;
 
 	if(numsLog != 0)
 	{
-		(*numsLog) << allKeyFramesHistory.back()->id << " "  <<
+		(*numsLog) << visualState.allKeyFramesHistory.back()->id << " "  <<
 				statistics_lastFineTrackRMSE << " "  <<
 				(int)statistics_numCreatedPoints << " "  <<
 				(int)statistics_numActivatedPoints << " "  <<
 				(int)statistics_numDroppedPoints << " "  <<
 				(int)statistics_lastNumOptIts << " "  <<
-				ef->resInA << " "  <<
-				ef->resInL << " "  <<
-				ef->resInM << " "  <<
+				visualState.ef->resInA << " "  <<
+				visualState.ef->resInL << " "  <<
+				visualState.ef->resInM << " "  <<
 				statistics_numMargResFwd << " "  <<
 				statistics_numMargResBwd << " "  <<
 				statistics_numForceDroppedResFwd << " "  <<
 				statistics_numForceDroppedResBwd << " "  <<
-				frameHessians.back()->aff_g2l().a << " "  <<
-				frameHessians.back()->aff_g2l().b << " "  <<
-				frameHessians.back()->shell->id - frameHessians.front()->shell->id << " "  <<
-				(int)frameHessians.size() << " "  << "\n";
+				visualState.frameHessians.back()->aff_g2l().a << " "  <<
+				visualState.frameHessians.back()->aff_g2l().b << " "  <<
+				visualState.frameHessians.back()->shell->id - visualState.frameHessians.front()->shell->id << " "  <<
+				(int)visualState.frameHessians.size() << " "  << "\n";
 		numsLog->flush();
 	}
 
@@ -1418,12 +2188,17 @@ void FullSystem::printLogLine()
 
 void FullSystem::printEigenValLine()
 {
+	printEigenValLine(visualState);
+}
+
+void FullSystem::printEigenValLine(VisualState& visualState)
+{
 	if(!setting_logStuff) return;
-	if(ef->lastHS.rows() < 12) return;
+	if(visualState.ef->lastHS.rows() < 12) return;
 
 
-	MatXX Hp = ef->lastHS.bottomRightCorner(ef->lastHS.cols()-CPARS,ef->lastHS.cols()-CPARS);
-	MatXX Ha = ef->lastHS.bottomRightCorner(ef->lastHS.cols()-CPARS,ef->lastHS.cols()-CPARS);
+	MatXX Hp = visualState.ef->lastHS.bottomRightCorner(visualState.ef->lastHS.cols()-CPARS,visualState.ef->lastHS.cols()-CPARS);
+	MatXX Ha = visualState.ef->lastHS.bottomRightCorner(visualState.ef->lastHS.cols()-CPARS,visualState.ef->lastHS.cols()-CPARS);
 	int n = Hp.cols()/8;
 	assert(Hp.cols()%8==0);
 
@@ -1445,10 +2220,10 @@ void FullSystem::printEigenValLine()
 		Ha.block(0,i*2,n*8,2) = tmp2;
 	}
 
-	VecX eigenvaluesAll = ef->lastHS.eigenvalues().real();
+	VecX eigenvaluesAll = visualState.ef->lastHS.eigenvalues().real();
 	VecX eigenP = Hp.topLeftCorner(n*6,n*6).eigenvalues().real();
 	VecX eigenA = Ha.topLeftCorner(n*2,n*2).eigenvalues().real();
-	VecX diagonal = ef->lastHS.diagonal();
+	VecX diagonal = visualState.ef->lastHS.diagonal();
 
 	std::sort(eigenvaluesAll.data(), eigenvaluesAll.data()+eigenvaluesAll.size());
 	std::sort(eigenP.data(), eigenP.data()+eigenP.size());
@@ -1459,46 +2234,51 @@ void FullSystem::printEigenValLine()
 	if(eigenAllLog != 0)
 	{
 		VecX ea = VecX::Zero(nz); ea.head(eigenvaluesAll.size()) = eigenvaluesAll;
-		(*eigenAllLog) << allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
+		(*eigenAllLog) << visualState.allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
 		eigenAllLog->flush();
 	}
 	if(eigenALog != 0)
 	{
 		VecX ea = VecX::Zero(nz); ea.head(eigenA.size()) = eigenA;
-		(*eigenALog) << allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
+		(*eigenALog) << visualState.allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
 		eigenALog->flush();
 	}
 	if(eigenPLog != 0)
 	{
 		VecX ea = VecX::Zero(nz); ea.head(eigenP.size()) = eigenP;
-		(*eigenPLog) << allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
+		(*eigenPLog) << visualState.allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
 		eigenPLog->flush();
 	}
 
 	if(DiagonalLog != 0)
 	{
 		VecX ea = VecX::Zero(nz); ea.head(diagonal.size()) = diagonal;
-		(*DiagonalLog) << allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
+		(*DiagonalLog) << visualState.allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
 		DiagonalLog->flush();
 	}
 
 	if(variancesLog != 0)
 	{
-		VecX ea = VecX::Zero(nz); ea.head(diagonal.size()) = ef->lastHS.inverse().diagonal();
-		(*variancesLog) << allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
+		VecX ea = VecX::Zero(nz); ea.head(diagonal.size()) = visualState.ef->lastHS.inverse().diagonal();
+		(*variancesLog) << visualState.allKeyFramesHistory.back()->id << " " <<  ea.transpose() << "\n";
 		variancesLog->flush();
 	}
 
-	std::vector<VecX> &nsp = ef->lastNullspaces_forLogging;
-	(*nullspacesLog) << allKeyFramesHistory.back()->id << " ";
+	std::vector<VecX> &nsp = visualState.ef->lastNullspaces_forLogging;
+	(*nullspacesLog) << visualState.allKeyFramesHistory.back()->id << " ";
 	for(unsigned int i=0;i<nsp.size();i++)
-		(*nullspacesLog) << nsp[i].dot(ef->lastHS * nsp[i]) << " " << nsp[i].dot(ef->lastbS) << " " ;
+		(*nullspacesLog) << nsp[i].dot(visualState.ef->lastHS * nsp[i]) << " " << nsp[i].dot(visualState.ef->lastbS) << " " ;
 	(*nullspacesLog) << "\n";
 	nullspacesLog->flush();
 
 }
 
 void FullSystem::printFrameLifetimes()
+{
+	printFrameLifetimes(visualState);
+}
+
+void FullSystem::printFrameLifetimes(VisualState& visualState)
 {
 	if(!setting_logStuff) return;
 
@@ -1509,7 +2289,7 @@ void FullSystem::printFrameLifetimes()
 	lg->open("logs/lifetimeLog.txt", std::ios::trunc | std::ios::out);
 	lg->precision(15);
 
-	for(FrameShell* s : allFrameHistory)
+	for(FrameShell* s : visualState.allFrameHistory)
 	{
 		(*lg) << s->id
 			<< " " << s->marginalizedAt

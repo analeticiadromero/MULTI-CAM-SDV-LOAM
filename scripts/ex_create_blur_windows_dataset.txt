@@ -1,0 +1,97 @@
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0004_sync \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/DATASETS_DEGRADADOS/degraded_0004 \
+    --camera image_00 \
+    --effect mixed \
+    --interval 300:520 \
+    --radius 5 \
+    --brightness 0.45 \
+    --contrast 0.55 \
+    --noise-sigma 22 \
+    --occlusion 0.25 \
+    --overwrite
+
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/kitti-360_original/data_2d_raw/2013_05_28_drive_0004_sync \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/DATASETS_DEGRADADOS/degraded_0004_random \
+    --camera image_00 \
+    --camera image_01 \
+    --effect mixed \
+    --random-windows 4 \
+    --random-min-length 40 \
+    --random-max-length 80 \
+    --radius 5 \
+    --brightness 0.45 \
+    --contrast 0.55 \
+    --noise-sigma 22 \
+    --occlusion 0.25 \
+    --seed 42 \
+    --overwrite
+
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0004_sync \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/DATASETS_DEGRADADOS/image_00_occlusion_random \
+    --camera image_00 \
+    --effect occlusion \
+    --random-windows 6 \
+    --random-min-length 40 \
+    --random-max-length 70 \
+    --occlusion 0.3 \
+    --seed 42 \
+    --overwrite
+
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0004_sync \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/DATASETS_DEGRADADOS/image_00_blur_dark_random \
+    --camera image_00 \
+    --effect blur_dark \
+    --random-windows 6 \
+    --random-min-length 40 \
+    --random-max-length 70 \
+    --seed 42 \
+    --overwrite
+
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0004_sync \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/DATASETS_DEGRADADOS/image_00_noise_random \
+    --camera image_00 \
+    --effect noise \
+    --random-windows 6 \
+    --random-min-length 40 \
+    --random-max-length 70 \
+    --noise-sigma 50 \
+    --seed 42 \
+    --overwrite
+
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0004_sync \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/dataset_degradado_cameras/image_0_occlusion \
+    --camera image_00 \
+    --effect occlusion \
+    --interval 1900:2905 \
+    --overwrite
+
+_______________kitti__________________________
+
+  python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/KITTI/09_oficial \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/KITTI/09_DEGRADADOS/image_1_mixed \
+    --camera image_1 \
+    --camera-subdir ""\
+    --effect mixed \
+    --interval 800:1590 \
+    --overwrite
+
+python3 create_blur_windows_dataset.py \
+    --source-root /media/analeticiaromero/ExtremeSSD/ANA/KITTI/09_oficial \
+    --output-root /media/analeticiaromero/ExtremeSSD/ANA/KITTI/09_DEGRADADOS/image_1_blur_random \
+    --camera image_1 \
+    --camera-subdir ""\
+    --effect blur \
+    --random-windows 5 \
+    --random-min-length 20 \
+    --random-max-length 60 \
+    --seed 8 \
+    --overwrite
+
+

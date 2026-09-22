@@ -814,7 +814,8 @@ bool CoarseTracker::trackNewestCoarse(
 		{
 			lvl++;
 			haveRepeated=true;
-			printf("REPEAT LEVEL!\n");
+			if(!setting_debugout_runquiet)
+				printf("REPEAT LEVEL!\n");
 		}
 	}
 
@@ -1004,6 +1005,7 @@ bool CoarseTracker::structPoseEstimation(SE3 &curToWorld, std::vector<std::pair<
 			break;
 		}
 	}
+	return (resNew < 1000000.0);
 }
 
 void CoarseTracker::debugPlotIDepthMap(float* minID_pt, float* maxID_pt, std::vector<IOWrap::Output3DWrapper*> &wraps)

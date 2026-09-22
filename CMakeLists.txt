@@ -1,12 +1,17 @@
 cmake_minimum_required(VERSION 2.8.3)
 project(sdv_loam)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -O3")
+# Configurar o padrão de C++ para C++14
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -O3")
 
 find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   image_transport
   roscpp
+  roslib
   sensor_msgs
   std_msgs
   nav_msgs

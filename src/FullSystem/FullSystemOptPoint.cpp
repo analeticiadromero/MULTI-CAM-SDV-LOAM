@@ -19,8 +19,15 @@ PointHessian* FullSystem::optimizeImmaturePoint(
 		ImmaturePoint* point, int minObs,
 		ImmaturePointTemporaryResidual* residuals)
 {
+	return optimizeImmaturePoint(visualState, point, minObs, residuals);
+}
+
+PointHessian* FullSystem::optimizeImmaturePoint(
+		VisualState& visualState, ImmaturePoint* point, int minObs,
+		ImmaturePointTemporaryResidual* residuals)
+{
 	int nres = 0;
-	for(FrameHessian* fh : frameHessians)
+	for(FrameHessian* fh : visualState.frameHessians)
 	{
 		if(fh != point->host)
 		{
@@ -31,7 +38,7 @@ PointHessian* FullSystem::optimizeImmaturePoint(
 			nres++;
 		}
 	}
-	assert(nres == ((int)frameHessians.size())-1);
+	assert(nres == ((int)visualState.frameHessians.size())-1);
 
 	bool print = false;
 
@@ -164,12 +171,12 @@ PointHessian* FullSystem::optimizeImmaturePoint(
 			r->setState(ResState::IN);
 			p->residuals.push_back(r);
 
-			if(r->target == frameHessians.back())
+			if(r->target == visualState.frameHessians.back())
 			{
 				p->lastResiduals[0].first = r;
 				p->lastResiduals[0].second = ResState::IN;
 			}
-			else if(r->target == (frameHessians.size()<2 ? 0 : frameHessians[frameHessians.size()-2]))
+			else if(r->target == (visualState.frameHessians.size()<2 ? 0 : visualState.frameHessians[visualState.frameHessians.size()-2]))
 			{
 				p->lastResiduals[1].first = r;
 				p->lastResiduals[1].second = ResState::IN;

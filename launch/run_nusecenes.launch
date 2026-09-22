@@ -1,0 +1,33 @@
+<launch>
+
+    <!--- sdv_loam -->    
+    <node pkg="sdv_loam"    type="sdv_loam"    name="sdv_loam"    output="screen"/>
+
+    <!--- Parameter List -->  
+    <rosparam param="imgTopics">
+    - /cam_front_right/raw
+    - /cam_front_left/raw
+    </rosparam>
+    <param name="lidarTopic" type="string" value="/lidar_top" />
+    <rosparam param="calib" subst_value="true">
+    - $(find sdv_loam)/calib/Nuscenes/CAM_FRONT_RIGHT.txt
+    - $(find sdv_loam)/calib/Nuscenes/CAM_FRONT_LEFT.txt
+    </rosparam>
+    <rosparam param="pathSensorPrameters" subst_value="true">
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_FRONT_RIGHT.txt
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_FRONT_LEFT.txt
+    </rosparam>
+    <param name="resultPath" type="string" value="$(find sdv_loam)/output/nusecenes_pred.txt" />
+    <!-- The visual core still uses one global intrinsic calibration. Track with
+         the camera that matches the first calib entry above. -->
+    <param name="trackingCameraId" type="int" value="0" />
+    <param name="maxCameraLidarSyncError" type="double" value="0.03" />
+    <param name="maxCoarseTrackingRMSE" type="double" value="12.0" />
+    <rosparam param="cameraTimeOffsets">
+    - 0.0
+    - 0.0
+    </rosparam>
+    <param name="mode" type="int" value="2" />
+    <param name="quiet" type="int" value="1" />
+
+</launch>

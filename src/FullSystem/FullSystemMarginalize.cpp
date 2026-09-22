@@ -24,11 +24,16 @@ namespace sdv_loam
 
 void FullSystem::flagFramesForMarginalization(FrameHessian* newFH)
 {
+	flagFramesForMarginalization(visualState, newFH);
+}
+
+void FullSystem::flagFramesForMarginalization(VisualState& visualState, FrameHessian* newFH)
+{
 	if(setting_minFrameAge > setting_maxFrames)
 	{
-		for(int i=setting_maxFrames;i<(int)frameHessians.size();i++)
+		for(int i=setting_maxFrames;i<(int)visualState.frameHessians.size();i++)
 		{
-			FrameHessian* fh = frameHessians[i-setting_maxFrames];
+			FrameHessian* fh = visualState.frameHessians[i-setting_maxFrames];
 			fh->flaggedForMarginalization = true;
 		}
 		return;
@@ -37,18 +42,18 @@ void FullSystem::flagFramesForMarginalization(FrameHessian* newFH)
 
 	int flagged = 0;
 	// marginalize all frames that have not enough points.
-	for(int i=0;i<(int)frameHessians.size();i++)
+	for(int i=0;i<(int)visualState.frameHessians.size();i++)
 	{
-		FrameHessian* fh = frameHessians[i];
+		FrameHessian* fh = visualState.frameHessians[i];
 		int in = fh->pointHessians.size() + fh->immaturePoints.size();
 		int out = fh->pointHessiansMarginalized.size() + fh->pointHessiansOut.size();
 
 
-		Vec2 refToFh=AffLight::fromToVecExposure(frameHessians.back()->ab_exposure, fh->ab_exposure,
-				frameHessians.back()->aff_g2l(), fh->aff_g2l());
+		Vec2 refToFh=AffLight::fromToVecExposure(visualState.frameHessians.back()->ab_exposure, fh->ab_exposure,
+				visualState.frameHessians.back()->aff_g2l(), fh->aff_g2l());
 
 		if( (in < setting_minPointsRemaining *(in+out) || fabs(logf((float)refToFh[0])) > setting_maxLogAffFacInWindow)
-				&& ((int)frameHessians.size())-flagged > setting_minFrames)
+				&& ((int)visualState.frameHessians.size())-flagged > setting_minFrames)
 		{
 			fh->flaggedForMarginalization = true;
 			flagged++;
@@ -60,14 +65,14 @@ void FullSystem::flagFramesForMarginalization(FrameHessian* newFH)
 	}
 
 	// marginalize one.
-	if((int)frameHessians.size()-flagged >= setting_maxFrames)
+	if((int)visualState.frameHessians.size()-flagged >= setting_maxFrames)
 	{
 		double smallestScore = 1;
 		FrameHessian* toMarginalize=0;
-		FrameHessian* latest = frameHessians.back();
+		FrameHessian* latest = visualState.frameHessians.back();
 
 
-		for(FrameHessian* fh : frameHessians)
+		for(FrameHessian* fh : visualState.frameHessians)
 		{
 			if(fh->frameID > latest->frameID-setting_minFrameAge || fh->frameID == 0) continue;
 
@@ -95,14 +100,19 @@ void FullSystem::flagFramesForMarginalization(FrameHessian* newFH)
 
 void FullSystem::marginalizeFrame(FrameHessian* frame)
 {
+	marginalizeFrame(visualState, frame);
+}
+
+void FullSystem::marginalizeFrame(VisualState& visualState, FrameHessian* frame)
+{
 	//! marginalize or remove all this frames points.
 	assert((int)frame->pointHessians.size()==0);
 
 
-	ef->marginalizeFrame(frame->efFrame);
+	visualState.ef->marginalizeFrame(frame->efFrame);
 
 	// drop all observations of existing points in that frame.
-	for(FrameHessian* fh : frameHessians)
+	for(FrameHessian* fh : visualState.frameHessians)
 	{
 		if(fh==frame) continue;
 
@@ -124,7 +134,7 @@ void FullSystem::marginalizeFrame(FrameHessian* frame)
 					else
 						statistics_numForceDroppedResBwd++;
 
-					ef->dropResidual(r->efResidual);
+					visualState.ef->dropResidual(r->efResidual);
 					deleteOut<PointFrameResidual>(ph->residuals,i);
 					break;
 				}
@@ -139,15 +149,15 @@ void FullSystem::marginalizeFrame(FrameHessian* frame)
             ow->publishKeyframes(v, true, &Hcalib);
     }
 
-	frame->shell->marginalizedAt = frameHessians.back()->shell->id;
+	frame->shell->marginalizedAt = visualState.frameHessians.back()->shell->id;
 	frame->shell->movedByOpt = frame->w2c_leftEps().norm();
 
-	deleteOutOrder<FrameHessian>(frameHessians, frame);
-	for(unsigned int i=0;i<frameHessians.size();i++)
-		frameHessians[i]->idx = i;
+	deleteOutOrder<FrameHessian>(visualState.frameHessians, frame);
+	for(unsigned int i=0;i<visualState.frameHessians.size();i++)
+		visualState.frameHessians[i]->idx = i;
 
-	setPrecalcValues();
-	ef->setAdjointsF(&Hcalib);
+	setPrecalcValues(visualState);
+	visualState.ef->setAdjointsF(&Hcalib);
 }
 
 }

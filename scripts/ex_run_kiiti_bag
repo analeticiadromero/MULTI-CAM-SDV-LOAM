@@ -1,0 +1,29 @@
+/home/analeticiaromero/SDV-LOAM_multi_abril_v6/SDV-LOAM_multi_abril/src/sdv_loam/scripts/run_kitti_bag_repeated.sh \
+    --runs 15 \
+    --tag multicam_kitti360_original \
+    --bag /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/bag/2013_05_28_drive_0004_complete.bag \
+    --output-dir /media/analeticiaromero/ExtremeSSD/ANA/KITTI/output
+
+
+
+/home/analeticiaromero/SDV-LOAM_multi_abril_v6/SDV-LOAM_multi_abril/src/sdv_loam/scripts/run_kitti360_bag_repeated.sh \
+    --runs 15 \
+    --tag multicam_kitti360_cam01 \
+    --bag /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/bag/2013_05_28_drive_0004_complete.bag \
+    --output-dir /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/output
+
+/home/analeticiaromero/SDV-LOAM_multi_abril_v6/SDV-LOAM_multi_abril/src/sdv_loam/scripts/run_kitti360_bag_repeated.sh \
+    --runs 15 \
+    --tag multicam_kitti360_noise \
+    --bag /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/dataset_degradado_cameras/2013_05_28_drive_0004_noise_cam0.bag \
+    --output-dir /media/analeticiaromero/ExtremeSSD/ANA/kitti-360/output
+
+
+________nuscenes_____________
+
+/home/analeticiaromero/SDV-LOAM_multi_abril_v6/SDV-LOAM_multi_abril/src/sdv_loam/scripts/run_nuscenes_bag_repeated.sh \
+    --runs 15 \
+    --tag multicam_nuscenes_original \
+    --bag /media/analeticiaromero/ExtremeSSD/ANA/nuscenes_bags/61.bag \
+    --output-dir /media/analeticiaromero/ExtremeSSD/ANA/nuscenes_output
+

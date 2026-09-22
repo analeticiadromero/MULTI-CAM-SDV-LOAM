@@ -18,6 +18,18 @@ using namespace std;
 namespace sdv_loam
 {
 
+static inline void trimCalibrationLine(std::string& line)
+{
+	while(!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+		line.pop_back();
+
+	size_t first = 0;
+	while(first < line.size() && (line[first] == ' ' || line[first] == '\t'))
+		first++;
+	if(first > 0)
+		line.erase(0, first);
+}
+
 PhotometricUndistorter::PhotometricUndistorter(
 		std::string file,
 		std::string noiseImage,
@@ -44,7 +56,7 @@ PhotometricUndistorter::PhotometricUndistorter(
 		printf("PhotometricUndistorter: Could not open file!\n");
 		return;
 	}
-
+	else
 	{
 		std::string line;
 		std::getline( f, line );
@@ -685,6 +697,10 @@ void Undistort::readFromFile(const char* configFileName, int nPars, std::string 
 	std::getline(infile,l2);
     std::getline(infile,l3);
     std::getline(infile,l4);
+	trimCalibrationLine(l1);
+	trimCalibrationLine(l2);
+	trimCalibrationLine(l3);
+	trimCalibrationLine(l4);
 
     if(nPars == 5)
 	{

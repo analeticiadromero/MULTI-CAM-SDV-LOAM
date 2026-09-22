@@ -1,0 +1,82 @@
+<launch>
+
+    <arg name="resultPath" default="$(find sdv_loam)/output/nuscenes_6cam_pred.txt" />
+
+    <!--- sdv_loam -->
+    <node pkg="sdv_loam" type="sdv_loam" name="sdv_loam" output="screen"/>
+
+    <!--
+        Camera order:
+        0 CAM_FRONT
+        1 CAM_FRONT_RIGHT
+        2 CAM_FRONT_LEFT
+        3 CAM_BACK
+        4 CAM_BACK_RIGHT
+        5 CAM_BACK_LEFT
+    -->
+    <rosparam param="imgTopics">
+    - /cam_front/raw
+    - /cam_front_right/raw
+    - /cam_front_left/raw
+    - /cam_back/raw
+    - /cam_back_right/raw
+    - /cam_back_left/raw
+    </rosparam>
+    <param name="lidarTopic" type="string" value="/lidar_top" />
+
+    <rosparam param="calib" subst_value="true">
+    - $(find sdv_loam)/calib/Nuscenes/CAM_FRONT.txt
+    - $(find sdv_loam)/calib/Nuscenes/CAM_FRONT_RIGHT.txt
+    - $(find sdv_loam)/calib/Nuscenes/CAM_FRONT_LEFT.txt
+    - $(find sdv_loam)/calib/Nuscenes/CAM_BACK.txt
+    - $(find sdv_loam)/calib/Nuscenes/CAM_BACK_RIGHT.txt
+    - $(find sdv_loam)/calib/Nuscenes/CAM_BACK_LEFT.txt
+    </rosparam>
+
+    <rosparam param="pathSensorPrameters" subst_value="true">
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_FRONT.txt
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_FRONT_RIGHT.txt
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_FRONT_LEFT.txt
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_BACK.txt
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_BACK_RIGHT.txt
+    - $(find sdv_loam)/sensor/Nuscenes/CAM_BACK_LEFT.txt
+    </rosparam>
+
+    <param name="resultPath" type="string" value="$(arg resultPath)" />
+    <param name="trackingCameraId" type="int" value="5" />
+
+    <param name="maxCameraLidarSyncError" type="double" value="0.03" />
+    <param name="maxCoarseTrackingRMSE" type="double" value="12.0" />
+    <param name="minCameraImageStddev" type="double" value="3.0" />
+    <param name="minCameraImageGradientMean" type="double" value="1.0" />
+    <param name="minCameraImageLaplacianVariance" type="double" value="20.0" />
+    <param name="cameraSwitchScoreMargin" type="double" value="200.0" />
+    <param name="cameraSwitchConsecutiveFrames" type="int" value="3" />
+    <param name="cameraSwitchMinInterval" type="double" value="0.50" />
+    <param name="cameraResetSwitchCooldown" type="double" value="1.00" />
+    <param name="cameraEligibilityWarmupFrames" type="int" value="30" />
+    <param name="eligibleCameraKeepRatio" type="double" value="0.67" />
+    <param name="minEligibleCameras" type="int" value="2" />
+    <param name="cameraEligibilitySuppressFrames" type="int" value="5" />
+    <param name="cameraEligibilityRestoreFrames" type="int" value="10" />
+    <param name="cameraEligibilityScoreAlpha" type="double" value="0.20" />
+    <param name="minFallbackWarmupFrames" type="int" value="4" />
+    <param name="minFallbackKeyframes" type="int" value="1" />
+    <param name="maxFallbackReadyRMSE" type="double" value="8.0" />
+    <param name="officialCameraMissingSwitchDelay" type="double" value="0.50" />
+    <param name="maxFallbackCameraTimestampLag" type="double" value="0.20" />
+
+    <!-- Approximate image-to-LiDAR timestamp offsets from nuScenes metadata. -->
+    <rosparam param="cameraTimeOffsets">
+    - 0.036
+    - 0.028
+    - 0.043
+    - 0.010
+    - 0.020
+    - 0.001
+    </rosparam>
+
+    <param name="mode" type="int" value="2" />
+    <param name="quiet" type="int" value="1" />
+
+</launch>

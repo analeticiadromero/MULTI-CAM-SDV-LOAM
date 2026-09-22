@@ -9,6 +9,7 @@
 #include <fstream>
 #include "util/NumType.h"
 #include "FullSystem/Residuals.h"
+#include "system/LidarProjectionResult.h"
 #include "util/ImageAndExposure.h"
 #include "opencv2/highgui/highgui.hpp"
 
@@ -85,6 +86,8 @@ struct FrameHessian
 
 	// constant info & pre-calculated values
 	FrameShell* shell;
+	int cameraId;
+	LidarProjectionResult lidarProjection;
 
 	Eigen::Vector3f* dI;				// trace, fine tracking. Used for direction select (not for gradient histograms etc.)
 	Eigen::Vector3f* dIp[PYR_LEVELS];	// coarse tracking / coarse initializer. NAN in [0] only.
@@ -110,7 +113,7 @@ struct FrameHessian
 	Vec6 nullspaces_scale;
 
 	// variable info.
-	SE3 worldToCam_evalPT;
+	SE3 worldToCam_evalPT;  // Legacy visual pose state. Semantically this is T_CW.
 
 	Vec10 state_zero;
 	Vec10 state_scaled;
@@ -121,14 +124,16 @@ struct FrameHessian
 	Vec10 state_backup;
 
     EIGEN_STRONG_INLINE const SE3 &get_worldToCam_evalPT() const {return worldToCam_evalPT;}
+    EIGEN_STRONG_INLINE const SE3 &getT_CW() const {return worldToCam_evalPT;}
+    EIGEN_STRONG_INLINE SE3 getT_WC() const {return worldToCam_evalPT.inverse();}
     EIGEN_STRONG_INLINE const Vec10 &get_state_zero() const {return state_zero;}
     EIGEN_STRONG_INLINE const Vec10 &get_state() const {return state;}
     EIGEN_STRONG_INLINE const Vec10 &get_state_scaled() const {return state_scaled;}
     EIGEN_STRONG_INLINE const Vec10 get_state_minus_stateZero() const {return get_state() - get_state_zero();}
 
 	// precalc values
-	SE3 PRE_worldToCam;
-	SE3 PRE_camToWorld;
+	SE3 PRE_worldToCam;  // Precomputed T_CW.
+	SE3 PRE_camToWorld;  // Precomputed T_WC.
 	std::vector<FrameFramePrecalc,Eigen::aligned_allocator<FrameFramePrecalc>> targetPrecalc;
 	MinimalImageB3* debugImage;
 
@@ -185,6 +190,26 @@ struct FrameHessian
 		setStateZero(this->get_state());
 	};
 
+	inline void setT_CW(const SE3 &T_CW, const Vec10 &state)
+	{
+		setEvalPT(T_CW, state);
+	}
+
+	inline void setT_WC(const SE3 &T_WC, const Vec10 &state)
+	{
+		setEvalPT(T_WC.inverse(), state);
+	}
+
+	inline void setT_CW_scaled(const SE3 &T_CW, const AffLight &aff_g2l)
+	{
+		setEvalPT_scaled(T_CW, aff_g2l);
+	}
+
+	inline void setT_WC_scaled(const SE3 &T_WC, const AffLight &aff_g2l)
+	{
+		setEvalPT_scaled(T_WC.inverse(), aff_g2l);
+	}
+
 	void release();
 
 	inline ~FrameHessian()
@@ -205,6 +230,7 @@ struct FrameHessian
 	inline FrameHessian()
 	{
 		instanceCounter++;
+		cameraId = 0;
 		flaggedForMarginalization=false;
 		frameID = -1;
 		efFrame = 0;

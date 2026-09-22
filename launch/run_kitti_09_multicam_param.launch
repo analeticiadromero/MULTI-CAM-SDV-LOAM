@@ -1,0 +1,59 @@
+<launch>
+
+    <arg name="resultPath" default="$(find sdv_loam)/output/kitti-09_param_sweep/pred.txt" />
+
+    <arg name="maxCameraLidarSyncError" default="0.03" />
+    <arg name="maxCoarseTrackingRMSE" default="12.0" />
+    <arg name="minCameraImageStddev" default="3.0" />
+    <arg name="minCameraImageGradientMean" default="1.0" />
+    <arg name="minCameraImageLaplacianVariance" default="20.0" />
+    <arg name="cameraSwitchScoreMargin" default="1000.0" />
+    <arg name="cameraSwitchConsecutiveFrames" default="3" />
+    <arg name="fallbackCameraQuarantineMinDuration" default="1.0" />
+    <arg name="fallbackCameraRecoveryStableFrames" default="12" />
+    <arg name="minFallbackWarmupFrames" default="4" />
+    <arg name="minFallbackKeyframes" default="1" />
+    <arg name="officialCameraMissingSwitchDelay" default="0.20" />
+    <arg name="trackingCameraId" default="-1" />
+    <arg name="quiet" default="1" />
+
+    <!--- sdv_loam -->
+    <node pkg="sdv_loam" type="sdv_loam" name="sdv_loam" output="screen"/>
+
+    <!--- Parameter List -->
+    <rosparam param="imgTopics">
+    - /image_left
+    - /image_right
+    </rosparam>
+    <param name="lidarTopic" type="string" value="/kitti/velo/pointcloud" />
+    <rosparam param="calib" subst_value="true">
+    - $(find sdv_loam)/calib/KITTI/09.txt
+    - $(find sdv_loam)/calib/KITTI/09.txt
+    </rosparam>
+    <rosparam param="pathSensorPrameters" subst_value="true">
+    - $(find sdv_loam)/sensor/09.txt
+    - $(find sdv_loam)/sensor/09_cam1.txt
+    </rosparam>
+
+    <param name="resultPath" type="string" value="$(arg resultPath)" />
+    <param name="trackingCameraId" type="int" value="$(arg trackingCameraId)" />
+    <param name="maxCameraLidarSyncError" type="double" value="$(arg maxCameraLidarSyncError)" />
+    <param name="maxCoarseTrackingRMSE" type="double" value="$(arg maxCoarseTrackingRMSE)" />
+    <param name="minCameraImageStddev" type="double" value="$(arg minCameraImageStddev)" />
+    <param name="minCameraImageGradientMean" type="double" value="$(arg minCameraImageGradientMean)" />
+    <param name="minCameraImageLaplacianVariance" type="double" value="$(arg minCameraImageLaplacianVariance)" />
+    <param name="cameraSwitchScoreMargin" type="double" value="$(arg cameraSwitchScoreMargin)" />
+    <param name="cameraSwitchConsecutiveFrames" type="int" value="$(arg cameraSwitchConsecutiveFrames)" />
+    <param name="fallbackCameraQuarantineMinDuration" type="double" value="$(arg fallbackCameraQuarantineMinDuration)" />
+    <param name="fallbackCameraRecoveryStableFrames" type="int" value="$(arg fallbackCameraRecoveryStableFrames)" />
+    <param name="minFallbackWarmupFrames" type="int" value="$(arg minFallbackWarmupFrames)" />
+    <param name="minFallbackKeyframes" type="int" value="$(arg minFallbackKeyframes)" />
+    <param name="officialCameraMissingSwitchDelay" type="double" value="$(arg officialCameraMissingSwitchDelay)" />
+    <rosparam param="cameraTimeOffsets">
+    - 0.0
+    - 0.0
+    </rosparam>
+    <param name="mode" type="int" value="1" />
+    <param name="quiet" type="int" value="$(arg quiet)" />
+
+</launch>

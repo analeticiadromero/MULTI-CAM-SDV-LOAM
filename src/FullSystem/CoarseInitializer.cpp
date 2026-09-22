@@ -763,16 +763,26 @@ void CoarseInitializer::setFirst(	CalibHessian* HCalib, FrameHessian* newFrameHe
 		dGrads[i].setZero();
 }
 
-void CoarseInitializer::setFirstFromLidar(CalibHessian* HCalib, FrameHessian* newFrameHessian, FullSystem* fullSystem)
+bool CoarseInitializer::setFirstFromLidar(CalibHessian* HCalib, FrameHessian* newFrameHessian, FullSystem* fullSystem, const LidarProjectionResult& lidarProjection)
 {
 	makeK(HCalib);
 	firstFrame = newFrameHessian;
 
 	PixelSelector sel(w[0],h[0]);
 
-	int lidarArea = (fullSystem->right - fullSystem->left) * (fullSystem->down - fullSystem->up);
-
-	std::vector<Eigen::Vector3d,Eigen::aligned_allocator<Eigen::Vector3d>> vCloudPixel = (fullSystem->qCloudPixel).front();
+	std::vector<Eigen::Vector3d,Eigen::aligned_allocator<Eigen::Vector3d>> vCloudPixel =
+		lidarProjection.cloudPixels;
+	int left = w[0], right = -1, up = h[0], down = -1;
+	for(size_t i = 0; i < vCloudPixel.size(); ++i)
+	{
+		const int u = static_cast<int>(vCloudPixel[i](0, 0));
+		const int v = static_cast<int>(vCloudPixel[i](1, 0));
+		if(u < left) left = u;
+		if(u > right) right = u;
+		if(v < up) up = v;
+		if(v > down) down = v;
+	}
+	const int lidarArea = (right >= left && down >= up) ? (right - left) * (down - up) : 0;
 
 	float* statusMap = new float[vCloudPixel.size()];
 	bool* statusMapB = new bool[vCloudPixel.size()];
@@ -876,6 +886,23 @@ void CoarseInitializer::setFirstFromLidar(CalibHessian* HCalib, FrameHessian* ne
 	delete[] statusMap;
 	delete[] statusMapB;
 
+	bool hasEnoughPointsForNN = true;
+	for(int lvl=0; lvl<pyrLevelsUsed; ++lvl)
+	{
+		if(numPoints[lvl] < 10)
+			hasEnoughPointsForNN = false;
+	}
+
+	if(numPoints[0] < 20 || !hasEnoughPointsForNN)
+	{
+		printf("LiDAR initialization rejected for camera %d: selected points per level",
+			lidarProjection.cameraId);
+		for(int lvl=0; lvl<pyrLevelsUsed; ++lvl)
+			printf(" %d", numPoints[lvl]);
+		printf(" from %zu projected points.\n", vCloudPixel.size());
+		return false;
+	}
+
 	makeNN();
 
 	thisToNext=SE3();
@@ -885,6 +912,7 @@ void CoarseInitializer::setFirstFromLidar(CalibHessian* HCalib, FrameHessian* ne
 	for(int i=0;i<pyrLevelsUsed;i++)
 		dGrads[i].setZero();
 
+	return true;
 }
 
 void CoarseInitializer::resetPoints(int lvl)
@@ -1074,4 +1102,3 @@ void CoarseInitializer::makeNN()
 		delete indexes[i];
 }
 }
-

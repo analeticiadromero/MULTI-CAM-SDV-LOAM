@@ -11,6 +11,7 @@ namespace sdv_loam
 {
 struct CalibHessian;
 struct FrameHessian;
+struct LidarProjectionResult;
 class FullSystem;
 
 
@@ -62,7 +63,7 @@ public:
 
 
 	void setFirst(CalibHessian* HCalib, FrameHessian* newFrameHessian);
-	void setFirstFromLidar(CalibHessian* HCalib, FrameHessian* newFrameHessian, FullSystem* fullSystem);
+	bool setFirstFromLidar(CalibHessian* HCalib, FrameHessian* newFrameHessian, FullSystem* fullSystem, const LidarProjectionResult& lidarProjection);
 
 	bool trackFrame(FrameHessian* newFrameHessian, std::vector<IOWrap::Output3DWrapper*> &wraps);
 	void calcTGrads(FrameHessian* newFrameHessian);
@@ -167,5 +168,3 @@ struct FLANNPointcloud
 };
 
 }
-
-
